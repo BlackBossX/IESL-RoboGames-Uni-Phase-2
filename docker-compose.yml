@@ -1,0 +1,65 @@
+services:
+  # Webots vehicle controller service
+  webots-controller:
+    # Uncomment to build locally instead of using pre-built image
+    # build:
+    #   context: .
+    #   dockerfile: controller.dockerfile
+    image: ghcr.io/iesl-robogames/webots-controller:latest
+    container_name: webots-controller
+    restart: unless-stopped
+    # Share network namespace with ardupilot-sitl to allow localhost communication
+    network_mode: "service:ardupilot-sitl"
+    stdin_open: true
+    tty: true
+    # Port mappings moved to ardupilot-sitl since we share its network namespace
+    # extra_hosts also moved to ardupilot-sitl (cannot be set when sharing network namespace)
+    volumes:
+      # Mount entire Webots controller library (includes shared libraries and Python)
+      # Adjust the path to match your Webots installation
+      - ${WEBOTS_HOME:-/usr/local/webots}/lib/controller:/usr/local/webots/lib/controller:ro
+      # Mount controller source code for easy modifications
+      - ./Webots/controller:/app:rw
+      # Webots temporary directory - configured in .env file
+      - ${WEBOTS_TMP_PATH:-/tmp/webots}:/tmp/webots:rw
+
+    environment:
+      - USER=${USER}
+      # Connect to Webots extern controller port 1234 on the host machine
+      - WEBOTS_CONTROLLER_URL=tcp://host.docker.internal:1234/Iris
+    depends_on:
+      - ardupilot-sitl
+
+  # ArduPilot SITL service with noVNC
+  ardupilot-sitl:
+    # Uncomment to build locally instead of using pre-built image
+    # build:
+    #   context: .
+    #   dockerfile: ardupilot.dockerfile
+    image: ghcr.io/iesl-robogames/ardupilot-sitl:latest
+    container_name: ardupilot-sitl
+    restart: unless-stopped
+    # Use bridge network check for isolation from host
+    networks:
+      - sim_net
+    privileged: true
+    stdin_open: true
+    tty: true
+    ports:
+      - "6080:6080"           # noVNC
+      - "5760-5763:5760-5763" # MAVLink TCP
+      - "5599:5599"           # Camera stream (from webots-controller)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # We can use :0 again because we are in an isolated network namespace
+      - DISPLAY=:0
+      - RESOLUTION=1920x1080
+    tmpfs:
+      - /tmp/.X11-unix:rw,nosuid,nodev,mode=1777
+    # noVNC web interface: http://localhost:6080
+    # MAVLink ports: 5760, 5762, 5763, 14550, 14551
+
+networks:
+  sim_net:
+    driver: bridge
