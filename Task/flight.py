@@ -196,8 +196,8 @@ class Brain:
         deadline = start_time + duration
         
         # PID constants — tuned low to prevent spinning
-        KP_YAW, KD_YAW = 0.015, 0.002
-        KP_LAT, KD_LAT = 0.0004, 0.0001
+        KP_YAW, KD_YAW = 0.025, 0.008
+        KP_LAT, KD_LAT = 0.001, 0.0001
         
         line_lost_count = 0
         ever_found_line = False
