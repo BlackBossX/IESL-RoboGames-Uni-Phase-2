@@ -13,6 +13,12 @@ from control import Control
 import time
 from sensor import Camera
 import queue
+import math
+
+# REQUIRED INPUT VARIABLE IN CODE
+# The array must contain two values. Format: [country1, country2]
+# If only one country needs to be visited, the second value will be: 0
+Airports = [1, 2]
 
 # ── HSV color ranges for detection (H: 0-179, S: 0-255, V: 0-255) ──────────
 COLOR_RANGES = {
@@ -44,11 +50,15 @@ class Brain:
         self._frame_queue = queue.Queue(maxsize=2)  # main-thread display queue
 
         # PID state
-        self._pid_integral = 0.0
-        self._pid_last_error = 0.0
+        self._prev_angle = 0.0
+        self._prev_error = 0.0
+        self._prev_yr = 0.0
+        self._smooth_angle = 0.0
+        self._smooth_error = 0.0
+        self._t_ctrl = time.time()
+        
         self._pid_last_time = None
         self._vy_smooth = 0.0          # smoothed lateral output
-        self._deriv_smooth = 0.0       # EMA-filtered derivative
         self._prev_vy = 0.0            # for rate limiter
 
         # AprilTag detector (tag36h11 family used in world)
@@ -163,44 +173,29 @@ class Brain:
                 best = (int(ids[i][0]), cx, cy, area, tc)
         return best
 
-    def _pid(self, error, kp=0.0004, ki=0.0000008, kd=0.0025, deadband=25):
-        """PID controller — returns smoothed output given pixel error.
-        deadband: errors smaller than this many pixels are treated as zero.
-        Derivative is EMA-filtered (alpha=0.25) to reduce noise.
-        Output EMA alpha=0.30.  Rate-limited to ±0.010 m/s per loop.
-        """
-        if abs(error) < deadband:
-            error = 0  # ignore tiny wobble
-        now = time.time()
-        dt = (now - self._pid_last_time) if self._pid_last_time else 0.05
-        self._pid_last_time = now
-        self._pid_integral += error * dt
-        self._pid_integral = max(-100, min(100, self._pid_integral))   # anti-windup
-        raw_deriv = (error - self._pid_last_error) / max(dt, 1e-4)
-        self._pid_last_error = error
-        # Derivative EMA filter (alpha=0.25) — suppresses high-frequency noise
-        self._deriv_smooth = 0.25 * raw_deriv + 0.75 * self._deriv_smooth
-        raw = kp * error + ki * self._pid_integral + kd * self._deriv_smooth
-        # Output EMA alpha=0.30
-        self._vy_smooth = 0.30 * raw + 0.70 * self._vy_smooth
-        # Rate limiter: max change of ±0.010 m/s per loop
-        delta = self._vy_smooth - self._prev_vy
-        delta = max(-0.010, min(0.010, delta))
-        self._prev_vy = self._prev_vy + delta
-        return self._prev_vy
+    def ema(self, prev, current, alpha):
+        return alpha * current + (1.0 - alpha) * prev
 
-    def line_follow(self, duration=30, forward_speed=0.2, land_on_tag=True, tag_ignore_secs=0):
+    def apply_dead_zone(self, val, dead_zone):
+        return 0.0 if abs(val) < dead_zone else val
+
+    def line_follow(self, duration=30, forward_speed=0.15, land_on_tag=True, tag_ignore_secs=0):
         """
         PID line follower using the yellow line detected by the downward camera.
-        Uses the bottom 40% of the frame as region-of-interest.
-        tag_ignore_secs: suppress AprilTag detection for this many seconds at start.
-        Returns the detected tag ID (int) if tag triggered exit, or None if timed out.
+        Uses bottom 40% ROI, separate PD controllers for yaw and lateral velocity,
+        EMA smoothing, and dead-zones for high stability.
         """
         print(f"Line following for {duration}s  (forward={forward_speed} m/s, tag_ignore={tag_ignore_secs}s)")
-        fw = 640  # frame width — will update from first frame
+        fw = 640
         tag_ignore_until = time.time() + tag_ignore_secs
-
         deadline = time.time() + duration
+        
+        # PID constants
+        KP_YAW, KD_YAW = 0.025, 0.004
+        KP_LAT, KD_LAT = 0.0004, 0.0001
+        
+        line_lost_count = 0
+
         while time.time() < deadline:
             frame = self._latest_frame
             if frame is None:
@@ -208,64 +203,126 @@ class Brain:
                 continue
 
             fh, fw = frame.shape[:2]
-            roi = frame[int(fh * 0.6):, :]          # bottom 40 % of frame
+            roi = frame[int(fh * 0.6):, :]
 
-            # Detect yellow line in ROI using brightness threshold
-            # (grayscale stream: yellow strip ≈ 170-226, dark floor ≈ 50-100)
             gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray_roi, 150, 255, cv2.THRESH_BINARY)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
-                                    np.ones((5, 5), np.uint8))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
-            M = cv2.moments(mask)
             roi_y0 = int(fh * 0.6)
-            # Use color-annotated frame as base so object overlays are visible
             disp = self._latest_display.copy() if self._latest_display is not None else frame.copy()
 
-            # Draw ROI boundary
             cv2.rectangle(disp, (0, roi_y0), (fw - 1, fh - 1), (80, 80, 80), 1)
-            cv2.putText(disp, "ROI", (4, roi_y0 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+            cv2.putText(disp, "ROI", (4, roi_y0 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
 
-            if M['m00'] > 500:                      # line found
-                cx = int(M['m10'] / M['m00'])       # centroid x in ROI
-                error = cx - fw // 2
-                vy = self._pid(error)
-                vy = max(-0.15, min(0.15, vy))
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            vy_cmd = 0.0
+            yr_cmd = 0.0
+            cur_fwd = forward_speed
 
-                # Tint ROI with green mask overlay
-                roi_tint = np.zeros_like(disp)
-                roi_tint[roi_y0:, :] = cv2.merge([
-                    np.zeros_like(mask), mask, np.zeros_like(mask)])  # green channel
-                cv2.addWeighted(roi_tint, 0.25, disp, 1.0, 0, disp)
+            if contours:
+                best_cnt = max(contours, key=cv2.contourArea)
+                M = cv2.moments(best_cnt)
+                if M['m00'] > 500:
+                    line_lost_count = 0
+                    cx = int(M['m10'] / M['m00'])
+                    raw_error = cx - fw // 2
 
-                # Vertical line at line centroid (full ROI height)
-                cv2.line(disp, (cx, roi_y0), (cx, fh), (0, 255, 255), 2)
+                    # Calculate angle
+                    [vx_l, vy_l, _x, _y] = cv2.fitLine(best_cnt, cv2.DIST_L2, 0, 0.01, 0.01)
+                    vx_l = float(vx_l[0])
+                    vy_l = float(vy_l[0])
+                    if vy_l > 0:  # Ensure vector points up the image
+                        vx_l, vy_l = -vx_l, -vy_l
+                    raw_angle_deg = math.degrees(math.atan2(vx_l, -vy_l))
 
-                # Frame centre vertical guide
-                cv2.line(disp, (fw//2, roi_y0), (fw//2, fh), (100, 100, 100), 1)
+                    # 1. Dead zones
+                    ang_ctrl = self.apply_dead_zone(raw_angle_deg, 2.0)
+                    lat_ctrl = self.apply_dead_zone(raw_error, 5.0)
 
-                # Error bar — horizontal arrow from centre to line
-                bar_y = roi_y0 + (fh - roi_y0) // 2
-                err_color = (0, 200, 255) if abs(error) < 20 else \
-                            (0, 140, 255) if abs(error) < 40 else (0, 60, 255)
-                cv2.arrowedLine(disp, (fw//2, bar_y), (cx, bar_y), err_color, 2, tipLength=0.15)
-                cv2.circle(disp, (cx, bar_y), 5, err_color, -1)
+                    # 2. EMA smoothing
+                    self._smooth_angle = self.ema(self._smooth_angle, ang_ctrl, 0.40)
+                    self._smooth_error = self.ema(self._smooth_error, lat_ctrl, 0.40)
 
-                # HUD panel — line info
-                hud = [(f"Line  x={cx}", (0, 255, 255)),
-                       (f"Err  {error:+d} px",  err_color),
-                       (f"Vy   {vy:+.3f} m/s", (200, 255, 200))]
-                for i, (txt, col) in enumerate(hud):
-                    yy = 48 + i * 22
-                    cv2.rectangle(disp, (0, yy - 16), (210, yy + 4), (0, 0, 0), -1)
-                    cv2.putText(disp, txt, (6, yy),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 1)
-            else:                                   # line lost
-                vy = 0.0
+                    # Time delta
+                    now = time.time()
+                    dt = max(now - self._t_ctrl, 0.01)
+                    self._t_ctrl = now
+
+                    # 3. PD for Yaw
+                    p_yaw = KP_YAW * self._smooth_angle
+                    d_yaw = KD_YAW * (self._smooth_angle - self._prev_angle) / dt
+                    self._prev_angle = self._smooth_angle
+
+                    ang_abs = abs(self._smooth_angle)
+                    max_yaw = 1.0 if ang_abs > 28.0 else 0.50
+                    raw_yr = max(-max_yaw, min(max_yaw, p_yaw + d_yaw))
+                    
+                    slew = 1.0 if ang_abs > 28.0 else 0.20
+                    yr_cmd = max(self._prev_yr - slew, min(self._prev_yr + slew, raw_yr))
+                    self._prev_yr = yr_cmd
+
+                    # 4. PD for Lateral
+                    p_lat = KP_LAT * self._smooth_error
+                    d_lat = KD_LAT * (self._smooth_error - self._prev_error) / dt
+                    self._prev_error = self._smooth_error
+
+                    vy_cmd = max(-0.12, min(0.12, p_lat + d_lat))
+
+                    # 5. Bend logic
+                    if ang_abs > 28.0:
+                        vy_cmd *= 0.4  # Prioritize yaw over lateral on sharp bends
+                    
+                    if ang_abs > 15.0:
+                        scale = max(0.4, 1.0 - (ang_abs - 15.0) / 90.0)
+                        cur_fwd = forward_speed * scale
+
+                    # --- DRAW HUD AND VIZ ---
+                    roi_tint = np.zeros_like(disp)
+                    roi_tint[roi_y0:, :] = cv2.merge([np.zeros_like(mask), mask, np.zeros_like(mask)])
+                    cv2.addWeighted(roi_tint, 0.25, disp, 1.0, 0, disp)
+
+                    cv2.line(disp, (cx, roi_y0), (cx, fh), (0, 255, 255), 2)
+                    cv2.line(disp, (fw//2, roi_y0), (fw//2, fh), (100, 100, 100), 1)
+
+                    err_color = (0, 200, 255) if abs(raw_error) < 20 else (0, 60, 255)
+                    bar_y = roi_y0 + (fh - roi_y0) // 2
+                    cv2.arrowedLine(disp, (fw//2, bar_y), (cx, bar_y), err_color, 2, tipLength=0.15)
+                    cv2.circle(disp, (cx, bar_y), 5, err_color, -1)
+
+                    hud = [
+                        (f"Line  x={cx}  Ang={raw_angle_deg:+.1f}", (0, 255, 255)),
+                        (f"Err  {raw_error:+d} px", err_color),
+                        (f"Vy={vy_cmd:+.3f}  Yr={yr_cmd:+.3f}", (200, 255, 200))
+                    ]
+                    for i, (txt, col) in enumerate(hud):
+                        yy = 48 + i * 22
+                        cv2.rectangle(disp, (0, yy - 16), (280, yy + 4), (0, 0, 0), -1)
+                        cv2.putText(disp, txt, (6, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 1)
+
+                else:
+                    line_lost_count += 1
+            else:
+                line_lost_count += 1
+            
+            if line_lost_count > 0:
                 cv2.rectangle(disp, (0, 40), (160, 68), (0, 0, 180), -1)
-                cv2.putText(disp, "LINE LOST", (6, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 80, 255), 2)
+                cv2.putText(disp, f"LOST {line_lost_count}", (6, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 80, 255), 2)
+                
+                if line_lost_count <= 15:
+                    # Keep yawing in last known direction briefly, tiny forward creep
+                    cur_fwd = 0.03
+                    yr_cmd = self._prev_yr
+                    vy_cmd = 0.0
+                else:
+                    cur_fwd = 0.0
+                    vy_cmd = 0.0
+                    yr_cmd = 0.0
+                    self._prev_yr = 0.0
+                    self._prev_angle = 0.0
+                    self._smooth_angle = 0.0
+                    self._t_ctrl = time.time()
 
             # ── AprilTag detection ──────────────────────────────────────────
             if time.time() >= tag_ignore_until:
@@ -312,7 +369,8 @@ class Brain:
                     return tid
 
             self._push_display(disp)
-            self.control.set_velocity(vx=forward_speed, vy=vy, vz=0)
+            # Apply velocity commands based on PID
+            self.control.set_velocity(vx=cur_fwd, vy=vy_cmd, vz=0, yaw_rate=yr_cmd)
 
         # Stop movement when done
         self.control.set_velocity(0, 0, 0)
@@ -355,39 +413,44 @@ class Brain:
     def _center_on_box(self, timeout=60.0):
         """
         Lock on the AprilTag / white-edge box center and land immediately.
-
-        Logic:
-          - Nudge slightly forward (NUDGE_FWD) every frame to keep the pad
-            from drifting behind the drone.
-          - Correct left/right with proportional control (no backward allowed).
-          - After 3 consecutive frames within LOCK_THRESH px → locked, descend.
-          - During descent keep correcting laterally all the way down.
+        Uses precise bidirectional PD control for fine alignment.
         """
         self._box_landed = False
-        LOCK_THRESH  = 25    # px — acceptable centering error
-        STABLE_NEED  = 3     # consecutive good frames to call it locked
-        NUDGE_FWD    = 0.03  # m/s constant tiny forward push while centering
+        LOCK_THRESH_X = 15    # px
+        LOCK_THRESH_Y = 15    # px
+        STABLE_NEED  = 8      # consecutive stable frames
+        
+        TAG_ALIGN_P_LAT = 0.0025
+        TAG_ALIGN_P_FWD = 0.0025
+        MAX_VEL = 0.15
 
-        # Short stop — just enough to kill momentum
+        # Target offsets: often want to drift slightly past center
+        TARGET_OFFSET_X = 0
+        TARGET_OFFSET_Y = 10  # 10 pixels below center (means move forward a bit)
+
+        # Short stop
         self.control.set_velocity(0, 0, 0)
         time.sleep(0.5)
 
         def _get_error(frame):
             fh, fw = frame.shape[:2]
+            target_x = fw // 2 + TARGET_OFFSET_X
+            target_y = fh // 2 + TARGET_OFFSET_Y
+            
             tag = self._detect_apriltag(frame)
             if tag is not None:
                 tid, tcx, tcy, tarea, tcorners = tag
-                return tcx - fw // 2, tcy - fh // 2, 'tag', (tcx, tcy, tcorners, tid)
+                return tcx - target_x, tcy - target_y, 'tag', (tcx, tcy, tcorners, tid)
             result = self._detect_box_center(frame)
             if result is not None:
                 bcx, bcy, pts, _ = result
-                return bcx - fw // 2, bcy - fh // 2, 'box', (bcx, bcy, pts)
+                return bcx - target_x, bcy - target_y, 'box', (bcx, bcy, pts)
             return None
 
         # ── Phase 1: center & lock ────────────────────────────────────────
         print("[LAND] Locking onto pad...")
         stable = 0
-        deadline = time.time() + 15.0   # fast timeout — don't hang forever
+        deadline = time.time() + 15.0
 
         while time.time() < deadline:
             frame = self._latest_frame
@@ -415,31 +478,41 @@ class Brain:
                     cv2.drawMarker(disp, (bcx, bcy), (255, 0, 255), cv2.MARKER_CROSS, 18, 2)
 
                 cv2.drawMarker(disp, (fw // 2, fh // 2), (0, 255, 255), cv2.MARKER_CROSS, 18, 1)
-                col = (0, 255, 0) if abs(ex) < LOCK_THRESH and abs(ey) < LOCK_THRESH else (0, 180, 255)
+                
+                centered = abs(ex) < LOCK_THRESH_X and abs(ey) < LOCK_THRESH_Y
+                col = (0, 255, 0) if centered else (0, 180, 255)
+                
                 cv2.rectangle(disp, (0, 0), (fw, 32), (0, 0, 0), -1)
                 cv2.putText(disp, f"[{source}] err=({ex:+d},{ey:+d})  lock={stable}/{STABLE_NEED}",
                             (6, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, col, 1)
 
-                if abs(ex) < LOCK_THRESH and abs(ey) < LOCK_THRESH:
+                if centered:
                     stable += 1
-                    self.control.set_velocity(NUDGE_FWD, 0, 0)   # tiny fwd creep while locked
+                    self.control.set_velocity(0, 0, 0)
                     if stable >= STABLE_NEED:
                         print(f"[LAND] LOCKED [{source}] err=({ex:+d},{ey:+d}) — descending")
                         self._push_display(disp)
                         break
                 else:
                     stable = 0
-                    # Lateral correction + constant tiny forward nudge
-                    vy_c = max(-0.10, min(0.10, ex * 0.0030))
-                    vx_c = max(NUDGE_FWD, min(0.12, NUDGE_FWD + ey * 0.0030))  # fwd-only
+                    # Align commands
+                    vx_c = -ey * TAG_ALIGN_P_FWD
+                    vy_c = ex * TAG_ALIGN_P_LAT
+                    
+                    vx_c = float(np.clip(vx_c, -MAX_VEL, MAX_VEL))
+                    vy_c = float(np.clip(vy_c, -MAX_VEL, MAX_VEL))
+                    
+                    if abs(ey) < LOCK_THRESH_Y: vx_c = 0.0
+                    if abs(ex) < LOCK_THRESH_X: vy_c = 0.0
+                    
                     self.control.set_velocity(vx=vx_c, vy=vy_c, vz=0)
             else:
                 stable = 0
                 cv2.rectangle(disp, (0, 0), (fw, 32), (0, 0, 0), -1)
                 cv2.putText(disp, "LAND: searching...", (6, 22),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 255), 1)
-                # Creep forward so pad comes into view
-                self.control.set_velocity(NUDGE_FWD, 0, 0)
+                # Lost target — default to tiny forward creep to find it
+                self.control.set_velocity(0.04, 0, 0)
 
             self._push_display(disp)
             time.sleep(0.04)
@@ -460,9 +533,15 @@ class Brain:
                 last_alt = alt_msg.relative_alt / 1000.0
 
             if last_alt <= 0.15:
-                print(f"[LAND] {last_alt:.2f} m — LAND command.")
+                print(f"[LAND] {last_alt:.2f} m — Touching down...")
+                # Hold down for 4 seconds
+                t_hold = time.time() + 4.5
+                while time.time() < t_hold:
+                    self.control.set_velocity(0, 0, 0.4)
+                    time.sleep(0.05)
+                
+                print("[LAND] Grounded wait complete.")
                 self.control.set_velocity(0, 0, 0)
-                self.control.land()
                 self._box_landed = True
                 return
 
@@ -486,9 +565,13 @@ class Brain:
 
             time.sleep(0.04)
 
-        print("[LAND] Timeout — LAND command.")
+        print("[LAND] Timeout — touching down.")
+        # Hold down for 4 seconds
+        t_hold = time.time() + 4.5
+        while time.time() < t_hold:
+            self.control.set_velocity(0, 0, 0.4)
+            time.sleep(0.05)
         self.control.set_velocity(0, 0, 0)
-        self.control.land()
         self._box_landed = True
 
     def _push_display(self, disp):
@@ -505,79 +588,150 @@ class Brain:
 
     def _reset_pid(self):
         """Reset PID state (call before a new line-follow phase)."""
-        self._pid_integral   = 0.0
-        self._pid_last_error = 0.0
+        self._prev_angle = 0.0
+        self._prev_error = 0.0
+        self._prev_yr = 0.0
+        self._smooth_angle = 0.0
+        self._smooth_error = 0.0
+        self._t_ctrl = time.time()
+        
         self._pid_last_time  = None
         self._vy_smooth      = 0.0
-        self._deriv_smooth   = 0.0
         self._prev_vy        = 0.0
 
     # ── main sequence ────────────────────────────────────────────────────────
+    def parse_tag(self, tag_id):
+        """
+        Parses the 3-digit AprilTag ID.
+        Digit 1 -> Country Code
+        Digit 2 -> Airport Status (1=Safe, 0=Unsafe)
+        Digit 3 -> Number of reachable airports
+        """
+        tag_str = str(tag_id).zfill(3)
+        country = int(tag_str[0])
+        status = int(tag_str[1])
+        reachables = int(tag_str[2])
+        return country, status, reachables
+
+    def align_to_next_path(self, current_tag_id, visited_edges):
+        """
+        Smoothly rotates the drone to find an unexplored outgoing yellow line.
+        Avoids rotating aggressively / repetitively taking the same paths.
+        """
+        print(f"[NAV] Scanning smoothly for new paths from Airport {current_tag_id}...")
+        
+        # Start a slow continuous rightward spin instead of snappy 30-degree jumps
+        spin_yaw_rate = 0.5 
+        self.control.set_velocity(0, 0, 0, yaw_rate=spin_yaw_rate)
+        
+        start_time = time.time()
+        last_found_q_yaw = None
+        
+        # Spin for maximum ~18 seconds (enough for a 360 at 0.4 rad/s)
+        while time.time() - start_time < 18.0:
+            self.control.set_velocity(0, 0, 0, yaw_rate=spin_yaw_rate)
+            time.sleep(0.05)
+            
+            frame = self._latest_frame
+            if frame is None: continue
+            
+            # Look at a narrow vertical sliver in the center-bottom to strictly find forward paths
+            fh, fw = frame.shape[:2]
+            roi = frame[int(fh * 0.6):, int(fw * 0.4):int(fw * 0.6)]
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            _, mask = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+            
+            if cv2.countNonZero(mask) > 200:
+                # We see a line! What direction is this?
+                current_yaw = self.control.get_current_yaw()
+                q_yaw = int(round(current_yaw / 45.0) * 45) % 360  # Quantize to 8 compass directions
+                
+                # Check if we already visited this exact path
+                if (current_tag_id, q_yaw) not in visited_edges:
+                    print(f"[NAV] Found an UNEXPLORED path at heading ~{q_yaw}°")
+                    # Stop rotating
+                    self.control.set_velocity(0, 0, 0, yaw_rate=0.0)
+                    time.sleep(0.5)
+                    visited_edges.add((current_tag_id, q_yaw))
+                    return True
+                else:
+                    if last_found_q_yaw != q_yaw:
+                        print(f"[NAV] Skipping already visited path at heading ~{q_yaw}°")
+                        last_found_q_yaw = q_yaw
+                        
+        print("[NAV] Full 360 spin finished, no unexplored paths found.")
+        self.control.set_velocity(0, 0, 0, yaw_rate=0.0)
+        return False
+
     def start(self):
-        """Force arm → takeoff → line1 → tag1: turn 90° CW → line2 → tag2: land"""
+        """Dynamic Graph Navigation Sequence"""
         print("MAVLink connected. Starting flight sequence...")
-        tag_ids = []  # collect detected AprilTag IDs
-
-        # 1. Set GUIDED mode
+        
         self.control.set_mode('GUIDED')
-
-        # 2. Force arm
         self.control.force_arm()
-
-        # 3. Takeoff to 2.2 m — wider FOV for larger/more stable line centroid
         self.control.takeoff(2.2)
 
-        # 4. Start camera
         cv2.namedWindow('Drone Camera', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('Drone Camera', 640, 480)
         self.camera.start_thread(self.process_frame)
         print("Camera started. Waiting for first frame...")
         while self._latest_frame is None:
             time.sleep(0.05)
-
-        # 5. Phase 1 — follow line until first AprilTag is close enough
-        print("=== Phase 1: following line to first AprilTag ===")
-        tag1_id = self.line_follow(duration=120, forward_speed=0.20, land_on_tag=False)
-
-        if tag1_id is not None:
-            tag_ids.append(tag1_id)
-            print(f"=== Phase 1 complete: detected AprilTag ID={tag1_id} ===")
-
-            # 6. Turn 90° clockwise
-            print("=== Turning 90° clockwise ===")
-            self.control.turn_yaw(90)
-            time.sleep(1.0)   # settle after turn
-
-            # 7. Reset PID for fresh start on new line
+            
+        targets = [target for target in Airports if target != 0]
+        
+        # Edge memory to avoid taking paths we just arrived from 
+        # Stores tuples of (Airport_ID, Quantized_Heading)
+        visited_edges = set() 
+        current_target_index = 0
+        
+        while current_target_index < len(targets):
+            target_country = targets[current_target_index]
+            print(f"\n[MISSION] Searching for Country {target_country}...")
+            
+            # Reset PID so line follow starts fresh
             self._reset_pid()
+            
+            tag_id = self.line_follow(duration=120, forward_speed=0.20, land_on_tag=False, tag_ignore_secs=3)
+            if tag_id is None:
+                print("[MISSION] Failed to find tag, landing.")
+                break
+                
+            arrival_yaw = self.control.get_current_yaw()
+            # The direction looking OUT at where we just came from is 180 degrees reversed
+            q_origin_yaw = int(round(((arrival_yaw + 180) % 360) / 45.0) * 45) % 360
+            visited_edges.add((tag_id, q_origin_yaw))
+            print(f"[MEMORY] Logged arrival path at airport {tag_id} as direction {q_origin_yaw}°")
+                
+            country, status, reachables = self.parse_tag(tag_id)
+            print(f"[TAG INFO] Country: {country}, Status: {'Safe' if status==1 else 'Unsafe'}, Reachable: {reachables}")
+            
+            if country == target_country:
+                if status == 1:
+                    print(f"*** FOUND TARGET COUNTRY {target_country} AND IT IS SAFE! Landing... ***")
+                    self._center_on_box()  # Lands and holds for 4.5s
+                    
+                    current_target_index += 1
+                    if current_target_index >= len(targets):
+                        print("[MISSION] All targets reached! Landing permanently.")
+                        break
+                    else:
+                        print(f"[MISSION] Proceeding to next target: {targets[current_target_index]}")
+                        self.control.takeoff(2.2)
+                else:
+                    print(f"*** FOUND TARGET COUNTRY {target_country} BUT UNSAFE FOR LANDING! Searching alternatives... ***")
+            else:
+                print(f"[MISSION] Arrived at Country {country}, not our target. Continuing search...")
+                
+            # Smart scan avoiding backwards trajectory/known loops
+            found_path = self.align_to_next_path(tag_id, visited_edges)
+            if not found_path:
+                print("No path found to continue, landing as failsafe.")
+                break
 
-            # 8. Phase 2 — follow next line to second AprilTag, then land
-            print("=== Phase 2: following line to second AprilTag ===")
-            tag2_id = self.line_follow(duration=120, forward_speed=0.20,
-                                       land_on_tag=True, tag_ignore_secs=10)
-            if tag2_id is not None:
-                tag_ids.append(tag2_id)
-                print(f"=== Phase 2 complete: detected AprilTag ID={tag2_id} ===")
-        else:
-            print("Timed out on phase 1 without finding tag — landing.")
-
-        # 9. Land
         self.control.land()
         print("Flight sequence complete.")
         cv2.destroyAllWindows()
-
-        # ── Print detected AprilTag IDs ──────────────────────────────────
-        print("")
-        print("=" * 50)
-        print("  DETECTED APRILTAG IDs")
-        print("=" * 50)
-        if len(tag_ids) >= 1:
-            print(f"  Tag 1 (phase 1):  ID = {tag_ids[0]}")
-        if len(tag_ids) >= 2:
-            print(f"  Tag 2 (phase 2):  ID = {tag_ids[1]}")
-        if not tag_ids:
-            print("  No tags detected.")
-        print("=" * 50)
 
     def __del__(self):
         """Destructor to ensure threads are stopped."""

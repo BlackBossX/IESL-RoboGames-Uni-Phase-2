@@ -1,0 +1,75 @@
+IRPORT REPRESENTATION
+Airports in the simulation are represented using a
+landing_pad_stand, which appears as a grey box
+with an AprilTag placed on its top surface.
+Each landing pad stand corresponds to one airport in
+the system.
+APRILTAG ENCODING FORMAT
+All tags used in the task belong to the AprilTag family:
+36h11
+Each AprilTag encodes a three-digit number. The
+digits represent the following information:
+Digit 1→ Country Code
+Digit 2→ Airport Status
+Digit 3→ Number of other airports reachable from this airport
+
+Country Code
+The first digit identifies the country to which the
+airport belongs.
+
+Status
+The second digit represents whether the airport
+is available for landing.
+Example interpretation:
+1- Landing safe
+0- Landing unsafe
+
+Reachable Airports
+The third digit indicates how many other
+airports can be reached directly from that
+airport.
+
+GRAPH NAVIGATION REQUIREMENTS
+The airports form a graph of connected nodes.
+Your drone must search through this graph to find a
+valid airport that belongs to the required country code.
+The solution must not rely on hardcoded airport
+locations or tag IDs.
+
+During evaluation:
+AprilTags on the landing pads will be swapped
+Target country codes will also be changed
+Therefore, your algorithm must dynamically:
+1. Read the AprilTag
+2. Interpret its encoded information
+3. Determine whether the airport belongs to the
+required country
+4. Navigate through connected airports until a valid
+one is found
+
+REQUIRED INPUT VARIABLE IN CODE
+Each team must include a clearly identifiable variable in
+the code that stores the requested target countries.
+This variable must be named exactly:
+Airports = []
+The array must contain two values. Format:
+Airports = [country1, country2]
+If only one country needs to be visited, the second
+value will be: 0
+this is to indicate that there is no second destination.
+
+Examples:
+Landing in two countries:
+Airports = [1, 2]
+Landing in one country:
+Airports = [1, 0]
+This variable is already included in the project code.
+You can find it in:
+Task Folder flight.py
+
+Evaluators will modify this variable when testing your
+solution.
+
+
+this is our new task .modify old flight.py file to our new task.it have curve paths also there are few april tags too i said the things i need to do :
+also i have idea to use Dijkstra's Algorithm to find the paths .
