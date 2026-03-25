@@ -194,7 +194,7 @@ class Control:
         print("Landed and motors disarmed!")
 
     
-    def set_velocity(self, vx, vy, vz):
+    def set_velocity(self, vx, vy, vz, yaw_rate=0.0):
         """Send a single velocity command (body frame).
         vx: forward+ / backward-
         vy: right+ / left-
@@ -205,11 +205,11 @@ class Control:
             self.master.target_system,
             self.master.target_component,
             mavutil.mavlink.MAV_FRAME_BODY_OFFSET_NED,
-            0b0000111111000111,  # velocity only
+            0b0000011111000111,  # velocity and yaw_rate (bit 11 is 0)
             0, 0, 0,
             vx, vy, vz,
             0, 0, 0,
-            0, 0
+            0, yaw_rate
         )
 
     def move_with_velocity(self, vx, vy, vz, duration, dt=0.1):
