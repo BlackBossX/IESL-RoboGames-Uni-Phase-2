@@ -67,6 +67,9 @@ class Brain:
         self._tag_detector = cv2.aruco.ArucoDetector(self._tag_dict, self._tag_params)
         self._tag_land_area = 20000  # px² — trigger landing only when drone is directly over pad
 
+        # Scan-once tag memory: {tag_id: (country, status, reachables)}
+        self._scanned_tags = {}
+
     # ── frame processing (runs in camera thread) ─────────────────────────────
     def process_frame(self, frame):
         """
@@ -179,54 +182,71 @@ class Brain:
     def apply_dead_zone(self, val, dead_zone):
         return 0.0 if abs(val) < dead_zone else val
 
-    def line_follow(self, duration=30, forward_speed=0.15, land_on_tag=True, tag_ignore_secs=0):
+    def line_follow(self, duration=30, forward_speed=0.15, land_on_tag=False, tag_ignore_secs=0, initial_straight_time=5.0):
         """
         PID line follower using the yellow line detected by the downward camera.
         Uses bottom 40% ROI, separate PD controllers for yaw and lateral velocity,
         EMA smoothing, and dead-zones for high stability.
+        Returns tag_id if a large enough tag is spotted, else None.
         """
-        print(f"Line following for {duration}s  (forward={forward_speed} m/s, tag_ignore={tag_ignore_secs}s)")
+        print(f"Line following for {duration}s  (forward={forward_speed} m/s, tag_ignore={tag_ignore_secs}s, straight={initial_straight_time}s)")
         fw = 640
-        tag_ignore_until = time.time() + tag_ignore_secs
-        deadline = time.time() + duration
+        start_time = time.time()
+        tag_ignore_until = start_time + tag_ignore_secs
+        deadline = start_time + duration
         
-        # PID constants
-        KP_YAW, KD_YAW = 0.025, 0.004
-        KP_LAT, KD_LAT = 0.0004, 0.0001
+        # PID constants — tuned low to prevent spinning
+        KP_YAW, KD_YAW = 0.025, 0.008
+        KP_LAT, KD_LAT = 0.001, 0.0001
         
         line_lost_count = 0
+        ever_found_line = False
 
         while time.time() < deadline:
+            loop_elapsed = time.time() - start_time
             frame = self._latest_frame
             if frame is None:
                 time.sleep(0.02)
                 continue
 
             fh, fw = frame.shape[:2]
-            roi = frame[int(fh * 0.6):, :]
+            roi_y0 = int(fh * 0.6)
+            roi_x0 = int(fw * 0.20)  # Cut 20% off the left
+            roi_x1 = int(fw * 0.80)  # Cut 20% off the right
+            roi = frame[roi_y0:, roi_x0:roi_x1]
 
             gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray_roi, 150, 255, cv2.THRESH_BINARY)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
-            roi_y0 = int(fh * 0.6)
             disp = self._latest_display.copy() if self._latest_display is not None else frame.copy()
 
-            cv2.rectangle(disp, (0, roi_y0), (fw - 1, fh - 1), (80, 80, 80), 1)
-            cv2.putText(disp, "ROI", (4, roi_y0 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+            cv2.rectangle(disp, (roi_x0, roi_y0), (roi_x1 - 1, fh - 1), (80, 80, 80), 1)
+            cv2.putText(disp, "ROI", (roi_x0 + 4, roi_y0 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
 
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Filter out thin lines using minAreaRect to find true thickness
+            valid_contours = []
+            for cnt in contours:
+                if cv2.contourArea(cnt) > 500:
+                    rect = cv2.minAreaRect(cnt)
+                    thickness = min(rect[1][0], rect[1][1])
+                    if thickness > 15:  # Minimum pixel thickness to be considered a valid path
+                        valid_contours.append(cnt)
             
             vy_cmd = 0.0
             yr_cmd = 0.0
             cur_fwd = forward_speed
 
-            if contours:
-                best_cnt = max(contours, key=cv2.contourArea)
+            if valid_contours:
+                best_cnt = max(valid_contours, key=cv2.contourArea)
                 M = cv2.moments(best_cnt)
-                if M['m00'] > 500:
+                if M['m00'] > 0:
+                    ever_found_line = True
                     line_lost_count = 0
-                    cx = int(M['m10'] / M['m00'])
+                    cx_roi = int(M['m10'] / M['m00'])
+                    cx = cx_roi + roi_x0
                     raw_error = cx - fw // 2
 
                     # Calculate angle
@@ -237,9 +257,9 @@ class Brain:
                         vx_l, vy_l = -vx_l, -vy_l
                     raw_angle_deg = math.degrees(math.atan2(vx_l, -vy_l))
 
-                    # 1. Dead zones
-                    ang_ctrl = self.apply_dead_zone(raw_angle_deg, 2.0)
-                    lat_ctrl = self.apply_dead_zone(raw_error, 5.0)
+                    # 1. Dead zones — wide to ignore noise from grayscale cam
+                    ang_ctrl = self.apply_dead_zone(raw_angle_deg, 5.0)
+                    lat_ctrl = self.apply_dead_zone(raw_error, 10.0)
 
                     # 2. EMA smoothing
                     self._smooth_angle = self.ema(self._smooth_angle, ang_ctrl, 0.40)
@@ -256,31 +276,44 @@ class Brain:
                     self._prev_angle = self._smooth_angle
 
                     ang_abs = abs(self._smooth_angle)
-                    max_yaw = 1.0 if ang_abs > 28.0 else 0.50
-                    raw_yr = max(-max_yaw, min(max_yaw, p_yaw + d_yaw))
                     
-                    slew = 1.0 if ang_abs > 28.0 else 0.20
-                    yr_cmd = max(self._prev_yr - slew, min(self._prev_yr + slew, raw_yr))
-                    self._prev_yr = yr_cmd
+                    if loop_elapsed < initial_straight_time:
+                        # Go straight, no rotating at all initially
+                        raw_yr = 0.0
+                        yr_cmd = 0.0
+                        self._prev_yr = 0.0
+                    else:
+                        # Ensure snappy yaw turns while staying smooth
+                        ramp_factor = min(1.0, (loop_elapsed - initial_straight_time) / 1.5) # Ramps up faster
+                        max_yaw = (0.8 if ang_abs > 28.0 else 0.45) * ramp_factor # Increased max yaw commands
+                        raw_yr = max(-max_yaw, min(max_yaw, p_yaw + d_yaw))
+                        
+                        base_slew = 2.0 if ang_abs > 25.0 else 0.40 # Apply the yaw change much swifter
+                        slew = base_slew * max(0.2, ramp_factor) 
+                        yr_cmd = max(self._prev_yr - slew, min(self._prev_yr + slew, raw_yr))
+                        self._prev_yr = yr_cmd
 
                     # 4. PD for Lateral
                     p_lat = KP_LAT * self._smooth_error
                     d_lat = KD_LAT * (self._smooth_error - self._prev_error) / dt
                     self._prev_error = self._smooth_error
 
-                    vy_cmd = max(-0.12, min(0.12, p_lat + d_lat))
+                    vy_cmd = max(-0.15, min(0.15, p_lat + d_lat)) # Increased max lateral strafing to get to the line quickly
+                    
+                    if loop_elapsed < initial_straight_time:
+                        vy_cmd = max(-0.04, min(0.04, vy_cmd)) # Limit side strafing during straight-phase
 
                     # 5. Bend logic
-                    if ang_abs > 28.0:
-                        vy_cmd *= 0.4  # Prioritize yaw over lateral on sharp bends
+                    if ang_abs > 25.0 and loop_elapsed >= initial_straight_time:
+                        vy_cmd *= 0.3  # Focus harder on turning rather than strafing at wide angles
                     
-                    if ang_abs > 15.0:
-                        scale = max(0.4, 1.0 - (ang_abs - 15.0) / 90.0)
+                    if ang_abs > 15.0 and loop_elapsed >= initial_straight_time:
+                        scale = max(0.15, 1.0 - (ang_abs - 15.0) / 45.0) # Slow down heavily for sharper bends
                         cur_fwd = forward_speed * scale
 
                     # --- DRAW HUD AND VIZ ---
                     roi_tint = np.zeros_like(disp)
-                    roi_tint[roi_y0:, :] = cv2.merge([np.zeros_like(mask), mask, np.zeros_like(mask)])
+                    roi_tint[roi_y0:, roi_x0:roi_x1] = cv2.merge([np.zeros_like(mask), mask, np.zeros_like(mask)])
                     cv2.addWeighted(roi_tint, 0.25, disp, 1.0, 0, disp)
 
                     cv2.line(disp, (cx, roi_y0), (cx, fh), (0, 255, 255), 2)
@@ -310,7 +343,12 @@ class Brain:
                 cv2.rectangle(disp, (0, 40), (160, 68), (0, 0, 180), -1)
                 cv2.putText(disp, f"LOST {line_lost_count}", (6, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 80, 255), 2)
                 
-                if line_lost_count <= 15:
+                if not ever_found_line and loop_elapsed < initial_straight_time:
+                    # Still taking off, push forward to find the start of the line
+                    cur_fwd = 0.15
+                    vy_cmd = 0.0
+                    yr_cmd = 0.0
+                elif line_lost_count <= 15:
                     # Keep yawing in last known direction briefly, tiny forward creep
                     cur_fwd = 0.03
                     yr_cmd = self._prev_yr
@@ -323,6 +361,10 @@ class Brain:
                     self._prev_angle = 0.0
                     self._smooth_angle = 0.0
                     self._t_ctrl = time.time()
+                    
+                    if line_lost_count > 250:  # Failsafe if line is lost for ~3-5 seconds
+                        print("[FAILSAFE] Line completely lost for too long!")
+                        return 'FAILSAFE'
 
             # ── AprilTag detection ──────────────────────────────────────────
             if time.time() >= tag_ignore_until:
@@ -354,18 +396,15 @@ class Brain:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
                 if tarea >= self._tag_land_area:
-                    # Flash red border
+                    # Flash border
                     cv2.rectangle(disp, (2, 2), (fw-2, fh-2), (0, 0, 255), 4)
                     cv2.rectangle(disp, (0, fh-32), (fw, fh), (0, 0, 180), -1)
-                    cv2.putText(disp, "LANDING ON TAG", (fw//2 - 100, fh - 8),
+                    cv2.putText(disp, "TAG FOUND", (fw//2 - 80, fh - 8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                     self._push_display(disp)
                     print(f"[TAG] Tag large enough (area={tarea:.0f}) — stopping.")
                     self.control.set_velocity(0, 0, 0)
                     time.sleep(0.3)
-                    if land_on_tag:
-                        print("[TAG] Preparing to land on box...")
-                        self._center_on_box()
                     return tid
 
             self._push_display(disp)
@@ -613,63 +652,187 @@ class Brain:
         reachables = int(tag_str[2])
         return country, status, reachables
 
+    def get_position(self):
+        """Get the current GPS position for memory mapping."""
+        msg = self.control.master.recv_match(type='GLOBAL_POSITION_INT', blocking=False)
+        if msg:
+            return (msg.lat / 1e7, msg.lon / 1e7)
+        return None
+
     def align_to_next_path(self, current_tag_id, visited_edges):
         """
-        Smoothly rotates the drone to find an unexplored outgoing yellow line.
-        Avoids rotating aggressively / repetitively taking the same paths.
+        Rotates the drone exactly 90 degrees iteratively to find an unexplored path.
         """
-        print(f"[NAV] Scanning smoothly for new paths from Airport {current_tag_id}...")
+        print(f"[NAV] Making 90-degree turns to find new paths from Airport {current_tag_id}...")
         
-        # Start a slow continuous rightward spin instead of snappy 30-degree jumps
-        spin_yaw_rate = 0.5 
-        self.control.set_velocity(0, 0, 0, yaw_rate=spin_yaw_rate)
-        
-        start_time = time.time()
-        last_found_q_yaw = None
-        
-        # Spin for maximum ~18 seconds (enough for a 360 at 0.4 rad/s)
-        while time.time() - start_time < 18.0:
-            self.control.set_velocity(0, 0, 0, yaw_rate=spin_yaw_rate)
-            time.sleep(0.05)
+        for _ in range(4):  # Check 4 orthogonal directions
+            # Stop and look
+            self.control.set_velocity(0, 0, 0, yaw_rate=0.0)
+            time.sleep(1.0)
             
             frame = self._latest_frame
-            if frame is None: continue
-            
-            # Look at a narrow vertical sliver in the center-bottom to strictly find forward paths
-            fh, fw = frame.shape[:2]
-            roi = frame[int(fh * 0.6):, int(fw * 0.4):int(fw * 0.6)]
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            _, mask = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
-            
-            if cv2.countNonZero(mask) > 200:
-                # We see a line! What direction is this?
-                current_yaw = self.control.get_current_yaw()
-                q_yaw = int(round(current_yaw / 45.0) * 45) % 360  # Quantize to 8 compass directions
+            if frame is not None:
+                # Look at a narrow vertical sliver in the center-bottom
+                fh, fw = frame.shape[:2]
+                roi = frame[int(fh * 0.6):, int(fw * 0.4):int(fw * 0.6)]
+                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                _, mask = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
                 
-                # Check if we already visited this exact path
-                if (current_tag_id, q_yaw) not in visited_edges:
-                    print(f"[NAV] Found an UNEXPLORED path at heading ~{q_yaw}°")
-                    # Stop rotating
-                    self.control.set_velocity(0, 0, 0, yaw_rate=0.0)
-                    time.sleep(0.5)
-                    visited_edges.add((current_tag_id, q_yaw))
-                    return True
-                else:
-                    if last_found_q_yaw != q_yaw:
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                valid_path_found = False
+                for cnt in contours:
+                    if cv2.contourArea(cnt) > 200:
+                        rect = cv2.minAreaRect(cnt)
+                        thickness = min(rect[1][0], rect[1][1])
+                        if thickness > 15:
+                            valid_path_found = True
+                            break
+                            
+                if valid_path_found:
+                    current_yaw = self.control.get_current_yaw()
+                    q_yaw = int(round(current_yaw / 90.0) * 90) % 360  # Quantize to 4 directions
+                    
+                    if (current_tag_id, q_yaw) not in visited_edges:
+                        print(f"[NAV] Found an UNEXPLORED path at heading ~{q_yaw}°")
+                        visited_edges.add((current_tag_id, q_yaw))
+                        return True
+                    else:
                         print(f"[NAV] Skipping already visited path at heading ~{q_yaw}°")
-                        last_found_q_yaw = q_yaw
+            
+            # If no suitable line found, snap exactly 90 degrees
+            print("[NAV] Turning 90 degrees...")
+            self.control.turn_yaw(90)
+            time.sleep(0.5)
                         
-        print("[NAV] Full 360 spin finished, no unexplored paths found.")
+        print("[NAV] Full 360 completed, no unexplored paths found.")
         self.control.set_velocity(0, 0, 0, yaw_rate=0.0)
         return False
 
+    def search_for_path_in_direction(self, yaw_target):
+        """
+        Turns to a specific yaw target and checks if there's a valid path line in front.
+        """
+        print(f"[NAV] Turning to heading {yaw_target}° to check for paths...")
+        
+        # Calculate shortest path to yaw_target
+        diff = yaw_target - self.control.get_current_yaw()
+        turn_angle = (diff + 180) % 360 - 180
+        
+        self.control.turn_yaw(turn_angle)
+        time.sleep(1.0)
+        
+        # Stop and observe
+        self.control.set_velocity(0, 0, 0, yaw_rate=0.0)
+        time.sleep(0.5)
+
+        for _ in range(10): # give it half a second to acquire
+            frame = self._latest_frame
+            if frame is not None:
+                fh, fw = frame.shape[:2]
+                roi = frame[int(fh * 0.6):, int(fw * 0.3):int(fw * 0.7)]
+                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                _, mask = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+                
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for cnt in contours:
+                    if cv2.contourArea(cnt) > 200:
+                        rect = cv2.minAreaRect(cnt)
+                        thickness = min(rect[1][0], rect[1][1])
+                        if thickness > 15:
+                            return True
+            time.sleep(0.05)
+            
+        return False
+
+    def find_all_path_angles(self, frame):
+        """
+        Analyzes the full 360-degree surroundings around the drone using the camera
+        to detect and measure all available path angles branching out from the current node.
+        Returns a list of angles (relative to current heading) where paths exist.
+        """
+        if frame is None:
+            return []
+            
+        fh, fw = frame.shape[:2]
+        center_x, center_y = fw // 2, fh // 2
+        
+        # Look at the whole frame except the very edges
+        roi = frame[10:-10, 10:-10] 
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        
+        # Use skeletonization/thinning or just fit lines to contours
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        path_angles = []
+        for cnt in contours:
+            if cv2.contourArea(cnt) > 800: # Needs to be a substantial line
+                rect = cv2.minAreaRect(cnt)
+                thickness = min(rect[1][0], rect[1][1])
+                
+                if thickness > 15:
+                    # Find the bounding box center to get direction relative to image center
+                    M = cv2.moments(cnt)
+                    if M['m00'] > 0:
+                        cx = int(M['m10'] / M['m00']) + 10 # adjust for roi offset
+                        cy = int(M['m01'] / M['m00']) + 10
+                        
+                        # Calculate angle from center of image to center of contour
+                        # 0 degrees is straight UP (-y direction in image coords)
+                        dx = cx - center_x
+                        dy = center_y - cy # Invert Y so up is positive
+                        
+                        angle_deg = math.degrees(math.atan2(dx, dy))
+                        path_angles.append(angle_deg)
+                        
+        # Cluster similar angles (e.g. within 30 degrees of each other)
+        clustered_angles = []
+        if path_angles:
+            path_angles.sort()
+            current_cluster = [path_angles[0]]
+            
+            for ang in path_angles[1:]:
+                if ang - current_cluster[-1] < 30:
+                    current_cluster.append(ang)
+                else:
+                    clustered_angles.append(sum(current_cluster) / len(current_cluster))
+                    current_cluster = [ang]
+            clustered_angles.append(sum(current_cluster) / len(current_cluster))
+            
+        print(f"[VISION] Detected structural path angles relative to drone: {[round(a,1) for a in clustered_angles]}")
+        return clustered_angles
+
     def start(self):
-        """Dynamic Graph Navigation Sequence"""
+        try:
+            self._run_mission()
+        except Exception as e:
+            print(f"\n[FAILSAFE] Connection lost or unexpected error: {e}")
+            print("[FAILSAFE] Initiating emergency landing...")
+            try:
+                self.control.land()
+            except Exception as inner_e:
+                print(f"Could not land gracefully: {inner_e}")
+        finally:
+            cv2.destroyAllWindows()
+
+    def _run_mission(self):
+        """
+        Simplified Navigation Sequence:
+        1. Take off
+        2. Follow line until a tag is found
+        3. Scan tag ONCE (skip if already scanned)
+        4. Check if it's the target — if yes, land
+        5. Otherwise, 90° turn and follow line the other way
+        6. Repeat until all target airports found
+        """
         print("MAVLink connected. Starting flight sequence...")
         
         self.control.set_mode('GUIDED')
         self.control.force_arm()
-        self.control.takeoff(2.2)
+        self.control.takeoff(1.7)
 
         cv2.namedWindow('Drone Camera', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('Drone Camera', 640, 480)
@@ -678,58 +841,193 @@ class Brain:
         while self._latest_frame is None:
             time.sleep(0.05)
             
-        targets = [target for target in Airports if target != 0]
+        targets = [t for t in Airports if t != 0]
+        targets_remaining = set(targets)
+        landed_airports = []
         
-        # Edge memory to avoid taking paths we just arrived from 
-        # Stores tuples of (Airport_ID, Quantized_Heading)
-        visited_edges = set() 
-        current_target_index = 0
+        # How many seconds to ignore tags after a turn (avoid immediate re-detect)
+        TAG_COOLDOWN = 5
         
-        while current_target_index < len(targets):
-            target_country = targets[current_target_index]
-            print(f"\n[MISSION] Searching for Country {target_country}...")
+        while targets_remaining:
+            print(f"\n[MISSION] Searching for remaining targets: {list(targets_remaining)}...")
             
-            # Reset PID so line follow starts fresh
+            # Reset PID so line follow starts clean
             self._reset_pid()
             
-            tag_id = self.line_follow(duration=120, forward_speed=0.20, land_on_tag=False, tag_ignore_secs=3)
-            if tag_id is None:
-                print("[MISSION] Failed to find tag, landing.")
-                break
-                
-            arrival_yaw = self.control.get_current_yaw()
-            # The direction looking OUT at where we just came from is 180 degrees reversed
-            q_origin_yaw = int(round(((arrival_yaw + 180) % 360) / 45.0) * 45) % 360
-            visited_edges.add((tag_id, q_origin_yaw))
-            print(f"[MEMORY] Logged arrival path at airport {tag_id} as direction {q_origin_yaw}°")
-                
-            country, status, reachables = self.parse_tag(tag_id)
-            print(f"[TAG INFO] Country: {country}, Status: {'Safe' if status==1 else 'Unsafe'}, Reachable: {reachables}")
+            # Follow the line until we hit a tag
+            tag_id = self.line_follow(
+                duration=120,
+                forward_speed=0.20,
+                land_on_tag=False,
+                tag_ignore_secs=TAG_COOLDOWN,
+                initial_straight_time=5.0
+            )
             
-            if country == target_country:
-                if status == 1:
-                    print(f"*** FOUND TARGET COUNTRY {target_country} AND IT IS SAFE! Landing... ***")
-                    self._center_on_box()  # Lands and holds for 4.5s
-                    
-                    current_target_index += 1
-                    if current_target_index >= len(targets):
-                        print("[MISSION] All targets reached! Landing permanently.")
-                        break
-                    else:
-                        print(f"[MISSION] Proceeding to next target: {targets[current_target_index]}")
-                        self.control.takeoff(2.2)
-                else:
-                    print(f"*** FOUND TARGET COUNTRY {target_country} BUT UNSAFE FOR LANDING! Searching alternatives... ***")
-            else:
-                print(f"[MISSION] Arrived at Country {country}, not our target. Continuing search...")
-                
-            # Smart scan avoiding backwards trajectory/known loops
-            found_path = self.align_to_next_path(tag_id, visited_edges)
-            if not found_path:
-                print("No path found to continue, landing as failsafe.")
+            if tag_id == 'FAILSAFE':
+                print("[MISSION] Failsafe triggered. Landing immediately.")
                 break
 
+            if tag_id is None:
+                print("[MISSION] No tag found within timeout. Landing.")
+                break
+            
+            # ── Check if already scanned ──────────────────────────────────
+            if tag_id in self._scanned_tags:
+                country, status, reachables = self._scanned_tags[tag_id]
+                print(f"[MEMORY] Already scanned tag {tag_id} → Country={country}, Safe={'Yes' if status==1 else 'No'}")
+            else:
+                # First time seeing this tag — scan and remember
+                country, status, reachables = self.parse_tag(tag_id)
+                self._scanned_tags[tag_id] = (country, status, reachables)
+                print(f"[SCAN] New tag {tag_id} → Country={country}, Safe={'Yes' if status==1 else 'No'}, Reachable={reachables}")
+            
+            # ── Check if this is our target BEFORE Pathing ─────────────────
+            if country in targets_remaining and status == 1:
+                print(f"*** FOUND TARGET COUNTRY {country} — SAFE! Checking for pad... ***")
+                
+                # Check for pad directly beneath/straight ahead without any turning
+                pad_seen = False
+                for _ in range(10):
+                    f = self._latest_frame
+                    if f is not None:
+                        if self._detect_box_center(f) is not None or self._detect_apriltag(f) is not None:
+                            pad_seen = True
+                            break
+                    time.sleep(0.05)
+                
+                if pad_seen:
+                    print(f"[LAND] Detected landing tag/pad for Country {country}! Centering and landing...")
+                    self._center_on_box()  # precise landing
+                    
+                    targets_remaining.remove(country)
+                    if country not in landed_airports:
+                        landed_airports.append(country)
+                    
+                    if not targets_remaining:
+                        print("[MISSION] All targets reached!")
+                        break
+                    
+                    print(f"[MISSION] Remaining targets: {list(targets_remaining)}")
+                    self.control.takeoff(1.7)
+                    time.sleep(2.0)
+                else:
+                    print("[LAND] Target reached but no landing pad seen directly here.")
+            
+            elif country in targets_remaining and status == 0:
+                print(f"[MISSION] Country {country} found but UNSAFE. Continuing search...")
+            else:
+                print(f"[MISSION] Country {country} is not a remaining target. Continuing...")
+
+            # ── Handle Path Navigation based on Reachable Paths ────────────
+            print(f"[NAV] Evaluating {reachables} paths ahead...")
+            
+            # Stop to get a clear picture of the intersection
+            self.control.set_velocity(0, 0, 0, yaw_rate=0.0)
+            time.sleep(1.0)
+            
+            detected_paths = self.find_all_path_angles(self._latest_frame)
+            current_yaw = self.control.get_current_yaw()
+            
+            if reachables == 3:
+                # Type 3: Intersection with 3 paths (Right-Hand Rule prioritized)
+                print("[NAV] Crossroad (3 paths). Applying RIGHT-HAND RULE...")
+                
+                if not detected_paths:
+                    print("[NAV] Warning: No paths visually detected! Blindly guessing Right.")
+                    self.control.turn_yaw(90)
+                else:
+                    # Filter out backward paths (we don't want to go back the way we came)
+                    forward_paths = [a for a in detected_paths if abs(a) < 145]
+                    
+                    # Right-hand bounds (~45 to ~145 deg)
+                    right_paths = [a for a in forward_paths if 40 <= a <= 140]
+                    # Straight bounds (~-40 to ~40 deg)
+                    straight_paths = [a for a in forward_paths if -40 < a < 40]
+                    
+                    if right_paths:
+                        # Prioritize right turn (closest to 90 deg)
+                        best_turn = min(right_paths, key=lambda a: abs(a - 90))
+                        print(f"[NAV] Right path found at {best_turn:.1f}°. Turning Right.")
+                        self.control.turn_yaw(best_turn)
+                        time.sleep(0.5)
+                    elif straight_paths:
+                        # Fallback to straight line
+                        best_continue = min(straight_paths, key=abs)
+                        print(f"[NAV] No Right path. Going straight towards {best_continue:.1f}°.")
+                        if abs(best_continue) > 12:
+                            self.control.turn_yaw(best_continue)
+                            time.sleep(0.5)
+                    else:
+                        # Fallback if weird angles are detected
+                        print("[NAV] No clear right or straight path. Attempting best available route...")
+                        best_choice = min(forward_paths, key=lambda a: abs(a - 90))
+                        self.control.turn_yaw(best_choice)
+                
+                print("[NAV] Pushing completely past the intersection node...")
+                self.control.move_with_velocity(0.18, 0, 0, duration=1.5)
+                continue
+                    
+            elif reachables == 2:
+                # Type 2: Standard road continuing (might have a sharp bend)
+                print("[NAV] Continuation road (2 paths). Following next path...")
+                
+                if not detected_paths:
+                    print("[NAV] Warning: No paths detected visually! Guessing straight.")
+                else:
+                    # Filter out the backward path we just came from
+                    forward_paths = [a for a in detected_paths if abs(a) < 145]
+                    
+                    if forward_paths:
+                        # The one remaining should be the continuous line
+                        best_path = min(forward_paths, key=abs)
+                        print(f"[NAV] Path continues at {best_path:.1f}°.")
+                        
+                        if abs(best_path) > 15: # Turn if it is a definite curve
+                            print(f"[NAV] Sharp bend detected. Adjusting yaw by {best_path:.1f}°.")
+                            self.control.turn_yaw(best_path)
+                            time.sleep(0.5)
+                    else:
+                        print("[NAV] Warning: Only backward path seen. Trying to force forward anyway.")
+                
+                # Crucial step: Blindly push forward aggressively to escape the intersection's noise radius
+                print("[NAV] Pushing forward to engage cleanly onto the continuous path...")
+                self.control.move_with_velocity(0.18, 0, 0, duration=1.5)
+                continue
+                
+            else:
+                # Dead end (Reachables = 1)
+                print("[NAV] End of physical path / dead-end. Spinning around 180°...")
+                self.control.turn_yaw(180)
+                time.sleep(1.0)
+                
+                print("[NAV] Returning...")
+                self.control.move_with_velocity(0.18, 0, 0, duration=1.5)
+                continue
+
         self.control.land()
+        
+        # --- Print Summary ---
+        print("\n" + "="*50)
+        print(" MISSION SUMMARY ".center(50, "="))
+        print("="*50)
+        
+        print("\n[ SCANNED AIRPORTS ]")
+        if not self._scanned_tags:
+            print("  None")
+        else:
+            for tag_id, (c_code, c_status, c_reach) in self._scanned_tags.items():
+                status_str = "SAFE" if c_status == 1 else "UNSAFE"
+                print(f"  - Tag {tag_id}: Country {c_code} | Status: {status_str} | Paths: {c_reach}")
+                
+        print("\n[ LANDED AIRPORTS ]")
+        if not landed_airports:
+            print("  None")
+        else:
+            for c in landed_airports:
+                print(f"  - Country {c}")
+                
+        print("\n" + "="*50 + "\n")
+        
         print("Flight sequence complete.")
         cv2.destroyAllWindows()
 

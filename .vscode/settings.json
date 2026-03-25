@@ -1,0 +1,13 @@
+{
+    "python.defaultInterpreterPath": "/home/malan/Documents/IESL-RoboGames-Uni-Phase1/venv/bin/python",
+    "python.analysis.extraPaths": [
+        "/home/malan/Documents/IESL-RoboGames-Uni-Phase1/Task",
+        "/home/malan/Documents/IESL-RoboGames-Uni-Phase1/venv/lib/python3.12/site-packages"
+    ],
+    "python.analysis.autoSearchPaths": true,
+    "python.analysis.diagnosticSeverityOverrides": {},
+    "python.venvPath": "/home/malan/Documents/IESL-RoboGames-Uni-Phase1",
+    "python.venvFolders": [
+        "venv"
+    ]
+}

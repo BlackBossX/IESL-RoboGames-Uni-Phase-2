@@ -200,12 +200,19 @@ class Control:
         vy: right+ / left-
         vz: down+ / up- (NED convention)
         """
+        if abs(yaw_rate) < 0.001:
+            # Ignore yaw_rate — let ArduPilot hold heading on its own
+            type_mask = 0b0000111111000111  # bit 11=1 → ignore yaw_rate
+        else:
+            # Actively control yaw_rate
+            type_mask = 0b0000011111000111  # bit 11=0 → use yaw_rate
+
         self.master.mav.set_position_target_local_ned_send(
             0,
             self.master.target_system,
             self.master.target_component,
             mavutil.mavlink.MAV_FRAME_BODY_OFFSET_NED,
-            0b0000011111000111,  # velocity and yaw_rate (bit 11 is 0)
+            type_mask,
             0, 0, 0,
             vx, vy, vz,
             0, 0, 0,
