@@ -2,7 +2,7 @@
 
 Run Iris quadcopter simulation with ArduPilot SITL + Webots 
 
-![Iris Quadcopter](Webots/worlds/.iris_Task_2.jpg)
+![Iris Quadcopter](Webots/worlds/iris_Task_2.jpg)
 
 ## About This Repository
 
