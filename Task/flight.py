@@ -696,7 +696,7 @@ class Brain:
         
         self.control.set_mode('GUIDED')
         self.control.force_arm()
-        self.control.takeoff(2.2)
+        self.control.takeoff(1.7)
 
         cv2.namedWindow('Drone Camera', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('Drone Camera', 640, 480)
@@ -752,7 +752,7 @@ class Brain:
                     break
                 else:
                     print(f"[MISSION] Next target: Country {targets[current_target_index]}")
-                    self.control.takeoff(2.2)
+                    self.control.takeoff(1.7)
                     continue
             
             if country == target_country and status == 0:
