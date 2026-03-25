@@ -210,31 +210,43 @@ class Brain:
                 continue
 
             fh, fw = frame.shape[:2]
-            roi = frame[int(fh * 0.6):, :]
+            roi_y0 = int(fh * 0.6)
+            roi_x0 = int(fw * 0.20)  # Cut 20% off the left
+            roi_x1 = int(fw * 0.80)  # Cut 20% off the right
+            roi = frame[roi_y0:, roi_x0:roi_x1]
 
             gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray_roi, 150, 255, cv2.THRESH_BINARY)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
-            roi_y0 = int(fh * 0.6)
             disp = self._latest_display.copy() if self._latest_display is not None else frame.copy()
 
-            cv2.rectangle(disp, (0, roi_y0), (fw - 1, fh - 1), (80, 80, 80), 1)
-            cv2.putText(disp, "ROI", (4, roi_y0 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+            cv2.rectangle(disp, (roi_x0, roi_y0), (roi_x1 - 1, fh - 1), (80, 80, 80), 1)
+            cv2.putText(disp, "ROI", (roi_x0 + 4, roi_y0 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
 
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Filter out thin lines using minAreaRect to find true thickness
+            valid_contours = []
+            for cnt in contours:
+                if cv2.contourArea(cnt) > 500:
+                    rect = cv2.minAreaRect(cnt)
+                    thickness = min(rect[1][0], rect[1][1])
+                    if thickness > 15:  # Minimum pixel thickness to be considered a valid path
+                        valid_contours.append(cnt)
             
             vy_cmd = 0.0
             yr_cmd = 0.0
             cur_fwd = forward_speed
 
-            if contours:
-                best_cnt = max(contours, key=cv2.contourArea)
+            if valid_contours:
+                best_cnt = max(valid_contours, key=cv2.contourArea)
                 M = cv2.moments(best_cnt)
-                if M['m00'] > 500:
+                if M['m00'] > 0:
                     ever_found_line = True
                     line_lost_count = 0
-                    cx = int(M['m10'] / M['m00'])
+                    cx_roi = int(M['m10'] / M['m00'])
+                    cx = cx_roi + roi_x0
                     raw_error = cx - fw // 2
 
                     # Calculate angle
@@ -271,13 +283,13 @@ class Brain:
                         yr_cmd = 0.0
                         self._prev_yr = 0.0
                     else:
-                        # Introduce yaw bit-by-bit by ramping up the max slew
-                        ramp_factor = min(1.0, (loop_elapsed - initial_straight_time) / 3.0)
-                        max_yaw = (0.6 if ang_abs > 28.0 else 0.30) * ramp_factor
+                        # Ensure snappy yaw turns while staying smooth
+                        ramp_factor = min(1.0, (loop_elapsed - initial_straight_time) / 1.5) # Ramps up faster
+                        max_yaw = (0.8 if ang_abs > 28.0 else 0.45) * ramp_factor # Increased max yaw commands
                         raw_yr = max(-max_yaw, min(max_yaw, p_yaw + d_yaw))
                         
-                        base_slew = 1.0 if ang_abs > 28.0 else 0.20
-                        slew = base_slew * max(0.1, ramp_factor)
+                        base_slew = 2.0 if ang_abs > 25.0 else 0.40 # Apply the yaw change much swifter
+                        slew = base_slew * max(0.2, ramp_factor) 
                         yr_cmd = max(self._prev_yr - slew, min(self._prev_yr + slew, raw_yr))
                         self._prev_yr = yr_cmd
 
@@ -286,22 +298,22 @@ class Brain:
                     d_lat = KD_LAT * (self._smooth_error - self._prev_error) / dt
                     self._prev_error = self._smooth_error
 
-                    vy_cmd = max(-0.12, min(0.12, p_lat + d_lat))
+                    vy_cmd = max(-0.15, min(0.15, p_lat + d_lat)) # Increased max lateral strafing to get to the line quickly
                     
                     if loop_elapsed < initial_straight_time:
                         vy_cmd = max(-0.04, min(0.04, vy_cmd)) # Limit side strafing during straight-phase
 
                     # 5. Bend logic
-                    if ang_abs > 28.0 and loop_elapsed >= initial_straight_time:
-                        vy_cmd *= 0.4  # Prioritize yaw over lateral on sharp bends
+                    if ang_abs > 25.0 and loop_elapsed >= initial_straight_time:
+                        vy_cmd *= 0.3  # Focus harder on turning rather than strafing at wide angles
                     
                     if ang_abs > 15.0 and loop_elapsed >= initial_straight_time:
-                        scale = max(0.4, 1.0 - (ang_abs - 15.0) / 90.0)
+                        scale = max(0.25, 1.0 - (ang_abs - 15.0) / 75.0) # Slow down heavily for sharper bends
                         cur_fwd = forward_speed * scale
 
                     # --- DRAW HUD AND VIZ ---
                     roi_tint = np.zeros_like(disp)
-                    roi_tint[roi_y0:, :] = cv2.merge([np.zeros_like(mask), mask, np.zeros_like(mask)])
+                    roi_tint[roi_y0:, roi_x0:roi_x1] = cv2.merge([np.zeros_like(mask), mask, np.zeros_like(mask)])
                     cv2.addWeighted(roi_tint, 0.25, disp, 1.0, 0, disp)
 
                     cv2.line(disp, (cx, roi_y0), (cx, fh), (0, 255, 255), 2)
@@ -661,8 +673,19 @@ class Brain:
                 roi = frame[int(fh * 0.6):, int(fw * 0.4):int(fw * 0.6)]
                 gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
                 _, mask = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
                 
-                if cv2.countNonZero(mask) > 200:
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                valid_path_found = False
+                for cnt in contours:
+                    if cv2.contourArea(cnt) > 200:
+                        rect = cv2.minAreaRect(cnt)
+                        thickness = min(rect[1][0], rect[1][1])
+                        if thickness > 15:
+                            valid_path_found = True
+                            break
+                            
+                if valid_path_found:
                     current_yaw = self.control.get_current_yaw()
                     q_yaw = int(round(current_yaw / 90.0) * 90) % 360  # Quantize to 4 directions
                     
@@ -743,24 +766,52 @@ class Brain:
             
             # ── Check if this is our target ────────────────────────────────
             if country == target_country and status == 1:
-                print(f"*** FOUND TARGET COUNTRY {target_country} — SAFE! Landing... ***")
-                self._center_on_box()  # precise landing
+                print(f"*** FOUND TARGET COUNTRY {target_country} — SAFE! Checking for pad... ***")
                 
-                current_target_index += 1
-                if current_target_index >= len(targets):
-                    print("[MISSION] All targets reached!")
-                    break
-                else:
+                # Check for pad immediately without any turning right
+                pad_seen = False
+                for _ in range(10):
+                    f = self._latest_frame
+                    if f is not None:
+                        # Check if a landing pad box or an AprilTag (landing tag) is visible
+                        if self._detect_box_center(f) is not None or self._detect_apriltag(f) is not None:
+                            pad_seen = True
+                            break
+                    time.sleep(0.05)
+                
+                if pad_seen:
+                    print("[LAND] Detected landing tag/pad! Centering and landing...")
+                    self._center_on_box()  # precise landing
+                    
+                    current_target_index += 1
+                    
+                    if current_target_index >= len(targets):
+                        print("[MISSION] All targets reached!")
+                        break
+                    
                     print(f"[MISSION] Next target: Country {targets[current_target_index]}")
                     self.control.takeoff(1.7)
-                    continue
+                    time.sleep(2.0)
+                    
+                    # After landing and taking off from the pad, turn 90 left to return to the path
+                    print("[NAV] Turning 90° counter-clockwise (left) to re-align with path...")
+                    self.control.set_velocity(0, 0, 0)
+                    time.sleep(0.5)
+                    self.control.turn_yaw(-90)
+                    time.sleep(1.5)
+                    
+                    # Continue straight ahead now without the default bottom 90°
+                    continue  # Important! This skips the bottom so it DOES NOT do an extra turn!
+                else:
+                    print("[LAND] No landing tag/pad seen here. Continuing...")
+                    # If we didn't find the pad, we fall through so it can keep searching
             
             if country == target_country and status == 0:
                 print(f"[MISSION] Country {target_country} found but UNSAFE. Continuing search...")
-            else:
+            elif country != target_country:
                 print(f"[MISSION] Country {country} ≠ target {target_country}. Continuing...")
             
-            # ── 90° turn and continue ─────────────────────────────────────
+            # ── Default 90° turn and continue for non-target or unsafe tags ──
             print("[NAV] Making 90° turn to follow next path...")
             self.control.set_velocity(0, 0, 0)
             time.sleep(0.5)
