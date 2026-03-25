@@ -843,6 +843,7 @@ class Brain:
             
         targets = [t for t in Airports if t != 0]
         targets_remaining = set(targets)
+        landed_airports = []
         
         # How many seconds to ignore tags after a turn (avoid immediate re-detect)
         TAG_COOLDOWN = 5
@@ -899,6 +900,8 @@ class Brain:
                     self._center_on_box()  # precise landing
                     
                     targets_remaining.remove(country)
+                    if country not in landed_airports:
+                        landed_airports.append(country)
                     
                     if not targets_remaining:
                         print("[MISSION] All targets reached!")
@@ -1002,6 +1005,29 @@ class Brain:
                 continue
 
         self.control.land()
+        
+        # --- Print Summary ---
+        print("\n" + "="*50)
+        print(" MISSION SUMMARY ".center(50, "="))
+        print("="*50)
+        
+        print("\n[ SCANNED AIRPORTS ]")
+        if not self._scanned_tags:
+            print("  None")
+        else:
+            for tag_id, (c_code, c_status, c_reach) in self._scanned_tags.items():
+                status_str = "SAFE" if c_status == 1 else "UNSAFE"
+                print(f"  - Tag {tag_id}: Country {c_code} | Status: {status_str} | Paths: {c_reach}")
+                
+        print("\n[ LANDED AIRPORTS ]")
+        if not landed_airports:
+            print("  None")
+        else:
+            for c in landed_airports:
+                print(f"  - Country {c}")
+                
+        print("\n" + "="*50 + "\n")
+        
         print("Flight sequence complete.")
         cv2.destroyAllWindows()
 
