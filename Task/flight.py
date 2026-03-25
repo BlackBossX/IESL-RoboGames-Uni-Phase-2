@@ -926,47 +926,69 @@ class Brain:
             current_yaw = self.control.get_current_yaw()
             
             if reachables == 3:
-                # Type 3: Intersection with 3 paths
-                print("[NAV] Crossroad (3 paths). Finding straightest path...")
+                # Type 3: Intersection with 3 paths (Right-Hand Rule prioritized)
+                print("[NAV] Crossroad (3 paths). Applying RIGHT-HAND RULE...")
                 
                 if not detected_paths:
-                    print("[NAV] Warning: No paths detected visually! Guessing straight.")
-                    continue
-                    
-                # Find the angle closest to 0 (straight ahead relative to drone)
-                straightest_angle = min(detected_paths, key=lambda a: abs(a))
-                
-                if abs(straightest_angle) < 45: # Tolerable "straight" bounds
-                    print(f"[NAV] Selected straight path at relative angle {straightest_angle:.1f}°")
-                    self.control.turn_yaw(straightest_angle)
-                    time.sleep(0.5)
+                    print("[NAV] Warning: No paths visually detected! Blindly guessing Right.")
+                    self.control.turn_yaw(90)
                 else:
-                    print(f"[NAV] Best straight path appears to be at {straightest_angle:.1f}°. Turning...")
-                    self.control.turn_yaw(straightest_angle)
-                    time.sleep(0.5)
+                    # Filter out backward paths (we don't want to go back the way we came)
+                    forward_paths = [a for a in detected_paths if abs(a) < 145]
+                    
+                    # Right-hand bounds (~45 to ~145 deg)
+                    right_paths = [a for a in forward_paths if 40 <= a <= 140]
+                    # Straight bounds (~-40 to ~40 deg)
+                    straight_paths = [a for a in forward_paths if -40 < a < 40]
+                    
+                    if right_paths:
+                        # Prioritize right turn (closest to 90 deg)
+                        best_turn = min(right_paths, key=lambda a: abs(a - 90))
+                        print(f"[NAV] Right path found at {best_turn:.1f}°. Turning Right.")
+                        self.control.turn_yaw(best_turn)
+                        time.sleep(0.5)
+                    elif straight_paths:
+                        # Fallback to straight line
+                        best_continue = min(straight_paths, key=abs)
+                        print(f"[NAV] No Right path. Going straight towards {best_continue:.1f}°.")
+                        if abs(best_continue) > 12:
+                            self.control.turn_yaw(best_continue)
+                            time.sleep(0.5)
+                    else:
+                        # Fallback if weird angles are detected
+                        print("[NAV] No clear right or straight path. Attempting best available route...")
+                        best_choice = min(forward_paths, key=lambda a: abs(a - 90))
+                        self.control.turn_yaw(best_choice)
+                
+                print("[NAV] Pushing completely past the intersection node...")
+                self.control.move_with_velocity(0.18, 0, 0, duration=1.5)
                 continue
                     
             elif reachables == 2:
                 # Type 2: Standard road continuing (might have a sharp bend)
-                print("[NAV] Continuation road (2 paths). Measuring and following path...")
+                print("[NAV] Continuation road (2 paths). Following next path...")
                 
                 if not detected_paths:
                     print("[NAV] Warning: No paths detected visually! Guessing straight.")
-                    continue
-                    
-                # Find the path that is NOT behind us (not near 180 or -180)
-                forward_paths = [a for a in detected_paths if abs(a) < 135]
-                
-                if forward_paths:
-                    best_path = min(forward_paths, key=lambda a: abs(a))
-                    if abs(best_path) > 15: # Only turn if it's actually a significant bend
-                        print(f"[NAV] Bend detected. Adjusting {best_path:.1f}° to follow path.")
-                        self.control.turn_yaw(best_path)
-                        time.sleep(0.5)
-                    else:
-                        print("[NAV] Path is mostly straight ahead. Proceeding.")
                 else:
-                    print("[NAV] Warning: Only backward paths seen. Trying to go straight.")
+                    # Filter out the backward path we just came from
+                    forward_paths = [a for a in detected_paths if abs(a) < 145]
+                    
+                    if forward_paths:
+                        # The one remaining should be the continuous line
+                        best_path = min(forward_paths, key=abs)
+                        print(f"[NAV] Path continues at {best_path:.1f}°.")
+                        
+                        if abs(best_path) > 15: # Turn if it is a definite curve
+                            print(f"[NAV] Sharp bend detected. Adjusting yaw by {best_path:.1f}°.")
+                            self.control.turn_yaw(best_path)
+                            time.sleep(0.5)
+                    else:
+                        print("[NAV] Warning: Only backward path seen. Trying to force forward anyway.")
+                
+                # Crucial step: Blindly push forward aggressively to escape the intersection's noise radius
+                print("[NAV] Pushing forward to engage cleanly onto the continuous path...")
+                self.control.move_with_velocity(0.18, 0, 0, duration=1.5)
                 continue
                 
             else:
@@ -974,6 +996,9 @@ class Brain:
                 print("[NAV] End of physical path / dead-end. Spinning around 180°...")
                 self.control.turn_yaw(180)
                 time.sleep(1.0)
+                
+                print("[NAV] Returning...")
+                self.control.move_with_velocity(0.18, 0, 0, duration=1.5)
                 continue
 
         self.control.land()
