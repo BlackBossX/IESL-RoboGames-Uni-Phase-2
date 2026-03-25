@@ -842,14 +842,13 @@ class Brain:
             time.sleep(0.05)
             
         targets = [t for t in Airports if t != 0]
-        current_target_index = 0
+        targets_remaining = set(targets)
         
         # How many seconds to ignore tags after a turn (avoid immediate re-detect)
         TAG_COOLDOWN = 5
         
-        while current_target_index < len(targets):
-            target_country = targets[current_target_index]
-            print(f"\n[MISSION] Searching for Country {target_country}...")
+        while targets_remaining:
+            print(f"\n[MISSION] Searching for remaining targets: {list(targets_remaining)}...")
             
             # Reset PID so line follow starts clean
             self._reset_pid()
@@ -882,8 +881,8 @@ class Brain:
                 print(f"[SCAN] New tag {tag_id} → Country={country}, Safe={'Yes' if status==1 else 'No'}, Reachable={reachables}")
             
             # ── Check if this is our target BEFORE Pathing ─────────────────
-            if country == target_country and status == 1:
-                print(f"*** FOUND TARGET COUNTRY {target_country} — SAFE! Checking for pad... ***")
+            if country in targets_remaining and status == 1:
+                print(f"*** FOUND TARGET COUNTRY {country} — SAFE! Checking for pad... ***")
                 
                 # Check for pad directly beneath/straight ahead without any turning
                 pad_seen = False
@@ -896,25 +895,25 @@ class Brain:
                     time.sleep(0.05)
                 
                 if pad_seen:
-                    print("[LAND] Detected landing tag/pad! Centering and landing...")
+                    print(f"[LAND] Detected landing tag/pad for Country {country}! Centering and landing...")
                     self._center_on_box()  # precise landing
                     
-                    current_target_index += 1
+                    targets_remaining.remove(country)
                     
-                    if current_target_index >= len(targets):
+                    if not targets_remaining:
                         print("[MISSION] All targets reached!")
                         break
                     
-                    print(f"[MISSION] Next target: Country {targets[current_target_index]}")
+                    print(f"[MISSION] Remaining targets: {list(targets_remaining)}")
                     self.control.takeoff(1.7)
                     time.sleep(2.0)
                 else:
                     print("[LAND] Target reached but no landing pad seen directly here.")
             
-            elif country == target_country and status == 0:
-                print(f"[MISSION] Country {target_country} found but UNSAFE. Continuing search...")
+            elif country in targets_remaining and status == 0:
+                print(f"[MISSION] Country {country} found but UNSAFE. Continuing search...")
             else:
-                print(f"[MISSION] Country {country} ≠ target {target_country}. Continuing...")
+                print(f"[MISSION] Country {country} is not a remaining target. Continuing...")
 
             # ── Handle Path Navigation based on Reachable Paths ────────────
             print(f"[NAV] Evaluating {reachables} paths ahead...")
