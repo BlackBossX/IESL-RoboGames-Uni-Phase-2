@@ -829,6 +829,7 @@ class Brain:
         6. Repeat until all target airports found
         """
         print("MAVLink connected. Starting flight sequence...")
+        mission_start_time = time.time()
         
         self.control.set_mode('GUIDED')
         self.control.force_arm()
@@ -1026,6 +1027,15 @@ class Brain:
             for c in landed_airports:
                 print(f"  - Country {c}")
                 
+        # Calculate time taken
+        mission_end_time = time.time()
+        total_time_seconds = mission_end_time - mission_start_time
+        mins = int(total_time_seconds // 60)
+        secs = int(total_time_seconds % 60)
+        
+        print("\n[ RUNTIME ]")
+        print(f"  TOTAL TIME: {mins}m {secs}s ({total_time_seconds:.1f} seconds)")
+
         print("\n" + "="*50 + "\n")
         
         print("Flight sequence complete.")
