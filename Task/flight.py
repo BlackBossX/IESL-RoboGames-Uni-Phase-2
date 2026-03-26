@@ -452,59 +452,78 @@ class Brain:
     def _center_on_box(self, timeout=60.0):
         """
         Lock on the AprilTag / white-edge box center and land immediately.
-        Uses precise bidirectional PD control for fine alignment.
+        Uses PD control + EMA smoothing to prevent oscillation.
         """
         self._box_landed = False
-        LOCK_THRESH_X = 15    # px
-        LOCK_THRESH_Y = 15    # px
-        STABLE_NEED  = 3      # consecutive stable frames
-        
-        TAG_ALIGN_P_LAT = 0.0025
-        TAG_ALIGN_P_FWD = 0.0025
-        MAX_VEL = 0.15
-
-        # Target offsets: often want to drift slightly past center
+ 
+        # ── Tuning constants ─────────────────────────────────────────────────
+        LOCK_THRESH_X   = 25        # px — wider dead-zone reduces jitter corrections
+        LOCK_THRESH_Y   = 25        # px
+        STABLE_NEED     = 8         # consecutive stable frames before descending
+ 
+        TAG_ALIGN_P_LAT = 0.0012    # P-gain lateral  (was 0.0025 — halved to reduce overshoot)
+        TAG_ALIGN_P_FWD = 0.0012    # P-gain forward   (was 0.0025)
+        KD_LAT          = 0.0008    # D-gain lateral   (new — dampens oscillation)
+        KD_FWD          = 0.0008    # D-gain forward   (new)
+        MAX_VEL         = 0.08      # m/s cap          (was 0.15 — softer corrections)
+ 
         TARGET_OFFSET_X = 0
-        TARGET_OFFSET_Y = 10  # 10 pixels below center (means move forward a bit)
-
-        # Short stop
+        TARGET_OFFSET_Y = 10        # aim 10px below center (slight forward bias on touchdown)
+ 
+        # EMA smoothing state (prevents reacting to single noisy frames)
+        ALPHA     = 0.35            # lower = smoother, higher = more responsive
+        smooth_ex = 0.0
+        smooth_ey = 0.0
+        prev_ex   = 0.0             # previous smoothed error for D-term
+        prev_ey   = 0.0
+ 
+        # Short stop — kill all momentum before starting alignment
         self.control.set_velocity(0, 0, 0)
         time.sleep(0.5)
-
+ 
+        # ── Inner helper: returns pixel error from pad center ─────────────────
         def _get_error(frame):
             fh, fw = frame.shape[:2]
             target_x = fw // 2 + TARGET_OFFSET_X
             target_y = fh // 2 + TARGET_OFFSET_Y
-            
+ 
+            # Try AprilTag first (more precise center)
             tag = self._detect_apriltag(frame)
             if tag is not None:
                 tid, tcx, tcy, tarea, tcorners = tag
                 return tcx - target_x, tcy - target_y, 'tag', (tcx, tcy, tcorners, tid)
+ 
+            # Fall back to white-edge box detector
             result = self._detect_box_center(frame)
             if result is not None:
                 bcx, bcy, pts, _ = result
                 return bcx - target_x, bcy - target_y, 'box', (bcx, bcy, pts)
+ 
             return None
-
-        # ── Phase 1: center & lock ────────────────────────────────────────
+ 
+        # ── Phase 1: center & lock ────────────────────────────────────────────
         print("[LAND] Locking onto pad...")
-        stable = 0
+        stable   = 0
         deadline = time.time() + 15.0
-
+ 
         while time.time() < deadline:
             frame = self._latest_frame
             if frame is None:
                 time.sleep(0.03)
                 continue
-
+ 
             fh, fw = frame.shape[:2]
             disp   = frame.copy()
             det    = _get_error(frame)
-
+ 
             if det is not None:
                 ex, ey, source, info = det
-
-                # Draw target
+ 
+                # ── EMA smoothing — prevent jerky single-frame reactions ──────
+                smooth_ex = ALPHA * ex + (1.0 - ALPHA) * smooth_ex
+                smooth_ey = ALPHA * ey + (1.0 - ALPHA) * smooth_ey
+ 
+                # ── Draw detection overlay ────────────────────────────────────
                 if source == 'tag':
                     tcx, tcy, tcorners, tid = info
                     cv2.aruco.drawDetectedMarkers(disp, [tcorners], np.array([[tid]]))
@@ -515,17 +534,21 @@ class Brain:
                     for i in range(4):
                         cv2.line(disp, tuple(pts[i]), tuple(pts[(i+1) % 4]), (255, 0, 255), 2)
                     cv2.drawMarker(disp, (bcx, bcy), (255, 0, 255), cv2.MARKER_CROSS, 18, 2)
-
+ 
                 cv2.drawMarker(disp, (fw // 2, fh // 2), (0, 255, 255), cv2.MARKER_CROSS, 18, 1)
-                
+ 
                 centered = abs(ex) < LOCK_THRESH_X and abs(ey) < LOCK_THRESH_Y
                 col = (0, 255, 0) if centered else (0, 180, 255)
-                
+ 
                 cv2.rectangle(disp, (0, 0), (fw, 32), (0, 0, 0), -1)
-                cv2.putText(disp, f"[{source}] err=({ex:+d},{ey:+d})  lock={stable}/{STABLE_NEED}",
-                            (6, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, col, 1)
-
+                cv2.putText(disp,
+                            f"[{source}] raw=({ex:+d},{ey:+d})  "
+                            f"smooth=({smooth_ex:+.1f},{smooth_ey:+.1f})  "
+                            f"lock={stable}/{STABLE_NEED}",
+                            (6, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+ 
                 if centered:
+                    # Already on target — hold still and count stable frames
                     stable += 1
                     self.control.set_velocity(0, 0, 0)
                     if stable >= STABLE_NEED:
@@ -534,25 +557,37 @@ class Brain:
                         break
                 else:
                     stable = 0
-                    # Align commands
-                    vx_c = -ey * TAG_ALIGN_P_FWD
-                    vy_c = ex * TAG_ALIGN_P_LAT
-                    
+ 
+                    # ── PD control on smoothed error ──────────────────────────
+                    # vx: forward/back  (+vx = move forward = increase image cy)
+                    # vy: left/right    (+vy = strafe right = increase image cx)
+                    vx_c = -(smooth_ey * TAG_ALIGN_P_FWD + (smooth_ey - prev_ey) * KD_FWD)
+                    vy_c =  (smooth_ex * TAG_ALIGN_P_LAT + (smooth_ex - prev_ex) * KD_LAT)
+ 
+                    # Clamp to max velocity
                     vx_c = float(np.clip(vx_c, -MAX_VEL, MAX_VEL))
                     vy_c = float(np.clip(vy_c, -MAX_VEL, MAX_VEL))
-                    
-                    if abs(ey) < LOCK_THRESH_Y: vx_c = 0.0
-                    if abs(ex) < LOCK_THRESH_X: vy_c = 0.0
-                    
+ 
+                    # Zero out already-aligned axis to avoid fighting settled axes
+                    if abs(ey) < LOCK_THRESH_Y:
+                        vx_c = 0.0
+                    if abs(ex) < LOCK_THRESH_X:
+                        vy_c = 0.0
+ 
                     self.control.set_velocity(vx=vx_c, vy=vy_c, vz=0)
+ 
+                # Update previous smoothed error for next D-term calculation
+                prev_ex = smooth_ex
+                prev_ey = smooth_ey
+ 
             else:
+                # Pad not visible — creep forward slowly to relocate
                 stable = 0
                 cv2.rectangle(disp, (0, 0), (fw, 32), (0, 0, 0), -1)
                 cv2.putText(disp, "LAND: searching...", (6, 22),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 255), 1)
-                # Lost target — default to tiny forward creep to find it
                 self.control.set_velocity(0.04, 0, 0)
-
+ 
             self._push_display(disp)
             time.sleep(0.04)
 

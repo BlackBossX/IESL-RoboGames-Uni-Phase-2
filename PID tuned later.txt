@@ -1,0 +1,65 @@
+8 frames drop to 3 chnage to 1 or 8 again if theres a issue
+
+
+Faster Normal Flight (flight.py):
+
+forward_speed increased from 0.20 to 0.35 m/s.
+initial_straight_time reduced from 5.0s to 2.0s (the drone wastes less time staying perfectly straight after finding a line).
+Faster Node/Intersection Passing (flight.py):
+
+The blind push forward through intersections was (0.18, duration=1.5). It is now a much faster and quicker burst: (0.35, duration=0.8).
+The time it stops and "thinks" at an intersection has been shrunk from 1.0s to 0.3s.
+Much Faster Landings (flight.py):
+
+Max alignment speed increased from 0.15 to 0.30.
+Reduced the number of "stable" frames needed from 8 down to 3 before it decides it's safe to descend.
+Increased the downward descent speeds (vz) so it drops out of the sky significantly faster.
+
+
+
+        LOCK_THRESH_X = 25    # px (Relaxed from 15)
+        LOCK_THRESH_Y = 25    # px (Relaxed from 15)
+        STABLE_NEED  = 3      # consecutive stable frames (Reduced from 8)
+        
+        TAG_ALIGN_P_LAT = 0.0035 # Slightly more aggressive alignment
+        TAG_ALIGN_P_FWD = 0.0035
+        MAX_VEL = 0.30 # Faster alignment speed 
+        
+                time.sleep(0.1) # Reduced from 0.5s  ---- time.sleep
+                
+                self.control.set_velocity(0, 0, 0.5) 
+                
+                
+                            vz = 0.50 if last_alt > 1.50 else \
+                 0.35 if last_alt > 0.80 else \
+                 0.20 if last_alt > 0.40 else 0.10 
+                 
+                 
+                 
+                 
+                 while targets_remaining:
+            print(f"\n[MISSION] Searching for remaining targets: {list(targets_remaining)}...")
+            
+            # Reset PID so line follow starts clean
+            self._reset_pid()
+            
+            # Follow the line until we hit a tag
+            tag_id = self.line_follow(
+                duration=120,
+                forward_speed=0.35, # Increased from 0.20 to 0.35
+                land_on_tag=False,
+                tag_ignore_secs=TAG_COOLDOWN,
+                initial_straight_time=2.0 # Reduced from 5.0 to 2.0
+            )
+            
+            
+            
+                       # Stop briefly to get a clear picture of the intersection
+            self.control.set_velocity(0, 0, 0, yaw_rate=0.0)
+            time.sleep(0.3) # Reduced from 1.0s
+            
+            
+            
+                   print("[NAV] Pushing completely past the intersection node...")
+                self.control.move_with_velocity(0.35, 0, 0, duration=0.8) # Faster, shorter burst
+                continue
