@@ -1,3 +1,8 @@
+        KP_YAW, KD_YAW = 0.030, 0.012
+        KP_LAT, KD_LAT = 0.0015, 0.0001
+
+
+
 8 frames drop to 3 chnage to 1 or 8 again if theres a issue
 
 

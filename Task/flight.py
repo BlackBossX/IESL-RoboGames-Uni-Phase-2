@@ -196,8 +196,8 @@ class Brain:
         deadline = start_time + duration
         
         # PID constants — tuned low to prevent spinning
-        KP_YAW, KD_YAW = 0.025, 0.008
-        KP_LAT, KD_LAT = 0.001, 0.0001
+        KP_YAW, KD_YAW = 0.035, 0.024
+        KP_LAT, KD_LAT = 0.0025, 0.0040
         
         line_lost_count = 0
         ever_found_line = False
@@ -285,11 +285,11 @@ class Brain:
                     else:
                         # Ensure snappy yaw turns while staying smooth
                         ramp_factor = min(1.0, (loop_elapsed - initial_straight_time) / 1.5) # Ramps up faster
-                        max_yaw = (0.8 if ang_abs > 28.0 else 0.45) * ramp_factor # Increased max yaw commands
+                        max_yaw = min(0.80, 0.10 + ang_abs * 0.016) * ramp_factor # Increased max yaw commands
                         raw_yr = max(-max_yaw, min(max_yaw, p_yaw + d_yaw))
                         
                         base_slew = 2.0 if ang_abs > 25.0 else 0.40 # Apply the yaw change much swifter
-                        slew = base_slew * max(0.2, ramp_factor) 
+                        slew = (0.25 + ang_abs * 0.012) * max(0.3, ramp_factor) 
                         yr_cmd = max(self._prev_yr - slew, min(self._prev_yr + slew, raw_yr))
                         self._prev_yr = yr_cmd
 
@@ -471,7 +471,7 @@ class Brain:
         TARGET_OFFSET_Y = 10        # aim 10px below center (slight forward bias on touchdown)
  
         # EMA smoothing state (prevents reacting to single noisy frames)
-        ALPHA     = 0.35            # lower = smoother, higher = more responsive
+        ALPHA     = 0.1            # lower = smoother, higher = more responsive
         smooth_ex = 0.0
         smooth_ey = 0.0
         prev_ex   = 0.0             # previous smoothed error for D-term
@@ -1004,26 +1004,43 @@ class Brain:
                 continue
                     
             elif reachables == 2:
-                # Type 2: Standard road continuing (might have a sharp bend)
-                print("[NAV] Continuation road (2 paths). Following next path...")
+                # Type 2: Standard road or split. Enforcing ANTICLOCKWISE (minus value) turns.
+                print("[NAV] Continuation road (2 paths)...")
                 
                 if not detected_paths:
-                    print("[NAV] Warning: No paths detected visually! Guessing straight.")
+                    print("[NAV] Warning: No paths detected visually! Guessing Left.")
+                    self.control.turn_yaw(-90)
                 else:
                     # Filter out the backward path we just came from
                     forward_paths = [a for a in detected_paths if abs(a) < 145]
                     
-                    if forward_paths:
-                        # The one remaining should be the continuous line
-                        best_path = min(forward_paths, key=abs)
-                        print(f"[NAV] Path continues at {best_path:.1f}°.")
-                        
-                        if abs(best_path) > 15: # Turn if it is a definite curve
-                            print(f"[NAV] Sharp bend detected. Adjusting yaw by {best_path:.1f}°.")
-                            self.control.turn_yaw(best_path)
+                    # Group into negative (left) and straight paths
+                    minus_paths = [a for a in forward_paths if a < -15]
+                    straight_paths = [a for a in forward_paths if -15 <= a <= 15]
+                    
+                    if minus_paths:
+                        # Prioritize the most direct left turn
+                        best_turn = max(minus_paths) # Closest to 0 on the negative side
+                        print(f"[NAV] Anticlockwise path found at {best_turn:.1f}°. Turning Left.")
+                        self.control.turn_yaw(best_turn)
+                        time.sleep(0.5)
+                    elif straight_paths:
+                        best_continue = min(straight_paths, key=abs)
+                        print(f"[NAV] Path continues straight at {best_continue:.1f}°.")
+                        if best_continue < 0: # Even micro-adjustments must be negative if possible
+                            self.control.turn_yaw(best_continue)
                             time.sleep(0.5)
                     else:
-                        print("[NAV] Warning: Only backward path seen. Trying to force forward anyway.")
+                        if forward_paths:
+                            # If only positive (clockwise) paths exist, convert to a negative turn!
+                            # E.g., +90 becomes -270 thereby still enforcing "only minus value turns".
+                            best_choice = min(forward_paths, key=abs)
+                            neg_equiv = best_choice - 360
+                            print(f"[NAV] Only clockwise path seen at {best_choice:.1f}°. Converting to negative turn {neg_equiv:.1f}°.")
+                            self.control.turn_yaw(neg_equiv)
+                            time.sleep(0.5)
+                        else:
+                            print("[NAV] Warning: Only backward path seen. Trying to force forward anyway.")
                 
                 # Crucial step: Blindly push forward aggressively to escape the intersection's noise radius
                 print("[NAV] Pushing forward to engage cleanly onto the continuous path...")
