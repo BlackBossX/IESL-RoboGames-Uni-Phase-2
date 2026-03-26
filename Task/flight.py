@@ -457,7 +457,7 @@ class Brain:
         self._box_landed = False
         LOCK_THRESH_X = 15    # px
         LOCK_THRESH_Y = 15    # px
-        STABLE_NEED  = 8      # consecutive stable frames
+        STABLE_NEED  = 3      # consecutive stable frames
         
         TAG_ALIGN_P_LAT = 0.0025
         TAG_ALIGN_P_FWD = 0.0025
@@ -584,9 +584,9 @@ class Brain:
                 self._box_landed = True
                 return
 
-            vz = 0.35 if last_alt > 1.50 else \
-                 0.20 if last_alt > 0.80 else \
-                 0.10 if last_alt > 0.40 else 0.05
+            vz = 0.80 if last_alt > 1.50 else \
+                 0.50 if last_alt > 0.80 else \
+                 0.20 if last_alt > 0.40 else 0.10
 
             # Pure vertical — no vx, no vy
             self.control.set_velocity(vx=0, vy=0, vz=vz)
@@ -858,7 +858,7 @@ class Brain:
             # Follow the line until we hit a tag
             tag_id = self.line_follow(
                 duration=120,
-                forward_speed=0.20,
+                forward_speed=0.25,
                 land_on_tag=False,
                 tag_ignore_secs=TAG_COOLDOWN,
                 initial_straight_time=5.0

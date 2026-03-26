@@ -7,7 +7,7 @@ import math
 
 
 class Control:
-    altitude_tolerance = 0.02  # meters
+    altitude_tolerance = 0.15  # meters
     arm_timout = 3
     
     def __init__(self):
@@ -127,7 +127,7 @@ class Control:
             if abs(current_alt - target_altitude) < self.altitude_tolerance:
                 print(f"Reached target altitude of {target_altitude} meters!")
                 break
-            time.sleep(1)
+            time.sleep(0.5)
 
     def turn_yaw(self, degrees):
         """
