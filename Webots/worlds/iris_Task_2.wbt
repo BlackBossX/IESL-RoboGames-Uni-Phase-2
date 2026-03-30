@@ -12,7 +12,7 @@ EXTERNPROTO "../protos/CurveStrip.proto"
 
 WorldInfo {
   title "Iris Ardupilot"
-  basicTimeStep 1
+  basicTimeStep 4
   FPS 20
 }
 Viewpoint {
@@ -465,3 +465,6 @@ CurveStrip {
     0 1 0.8
   ]
 }
+
+
+
