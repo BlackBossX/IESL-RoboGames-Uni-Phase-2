@@ -196,8 +196,8 @@ class Brain:
         deadline = start_time + duration
         
         # PID constants — tuned low to prevent spinning
-        KP_YAW, KD_YAW = 0.025, 0.008
-        KP_LAT, KD_LAT = 0.001, 0.0001
+        KP_YAW, KD_YAW = 0.035, 0.024
+        KP_LAT, KD_LAT = 0.0025, 0.0040
         
         line_lost_count = 0
         ever_found_line = False
@@ -285,11 +285,11 @@ class Brain:
                     else:
                         # Ensure snappy yaw turns while staying smooth
                         ramp_factor = min(1.0, (loop_elapsed - initial_straight_time) / 1.5) # Ramps up faster
-                        max_yaw = (0.8 if ang_abs > 28.0 else 0.45) * ramp_factor # Increased max yaw commands
+                        max_yaw = min(0.80, 0.10 + ang_abs * 0.016) * ramp_factor # Increased max yaw commands
                         raw_yr = max(-max_yaw, min(max_yaw, p_yaw + d_yaw))
                         
                         base_slew = 2.0 if ang_abs > 25.0 else 0.40 # Apply the yaw change much swifter
-                        slew = base_slew * max(0.2, ramp_factor) 
+                        slew = (0.25 + ang_abs * 0.012) * max(0.3, ramp_factor) 
                         yr_cmd = max(self._prev_yr - slew, min(self._prev_yr + slew, raw_yr))
                         self._prev_yr = yr_cmd
 
@@ -452,59 +452,78 @@ class Brain:
     def _center_on_box(self, timeout=60.0):
         """
         Lock on the AprilTag / white-edge box center and land immediately.
-        Uses precise bidirectional PD control for fine alignment.
+        Uses PD control + EMA smoothing to prevent oscillation.
         """
         self._box_landed = False
-        LOCK_THRESH_X = 15    # px
-        LOCK_THRESH_Y = 15    # px
-        STABLE_NEED  = 8      # consecutive stable frames
-        
-        TAG_ALIGN_P_LAT = 0.0025
-        TAG_ALIGN_P_FWD = 0.0025
-        MAX_VEL = 0.15
-
-        # Target offsets: often want to drift slightly past center
+ 
+        # ── Tuning constants ─────────────────────────────────────────────────
+        LOCK_THRESH_X   = 25        # px — wider dead-zone reduces jitter corrections
+        LOCK_THRESH_Y   = 25        # px
+        STABLE_NEED     = 8         # consecutive stable frames before descending
+ 
+        TAG_ALIGN_P_LAT = 0.0012    # P-gain lateral  (was 0.0025 — halved to reduce overshoot)
+        TAG_ALIGN_P_FWD = 0.0012    # P-gain forward   (was 0.0025)
+        KD_LAT          = 0.0008    # D-gain lateral   (new — dampens oscillation)
+        KD_FWD          = 0.0008    # D-gain forward   (new)
+        MAX_VEL         = 0.08      # m/s cap          (was 0.15 — softer corrections)
+ 
         TARGET_OFFSET_X = 0
-        TARGET_OFFSET_Y = 10  # 10 pixels below center (means move forward a bit)
-
-        # Short stop
+        TARGET_OFFSET_Y = 10        # aim 10px below center (slight forward bias on touchdown)
+ 
+        # EMA smoothing state (prevents reacting to single noisy frames)
+        ALPHA     = 0.1            # lower = smoother, higher = more responsive
+        smooth_ex = 0.0
+        smooth_ey = 0.0
+        prev_ex   = 0.0             # previous smoothed error for D-term
+        prev_ey   = 0.0
+ 
+        # Short stop — kill all momentum before starting alignment
         self.control.set_velocity(0, 0, 0)
         time.sleep(0.5)
-
+ 
+        # ── Inner helper: returns pixel error from pad center ─────────────────
         def _get_error(frame):
             fh, fw = frame.shape[:2]
             target_x = fw // 2 + TARGET_OFFSET_X
             target_y = fh // 2 + TARGET_OFFSET_Y
-            
+ 
+            # Try AprilTag first (more precise center)
             tag = self._detect_apriltag(frame)
             if tag is not None:
                 tid, tcx, tcy, tarea, tcorners = tag
                 return tcx - target_x, tcy - target_y, 'tag', (tcx, tcy, tcorners, tid)
+ 
+            # Fall back to white-edge box detector
             result = self._detect_box_center(frame)
             if result is not None:
                 bcx, bcy, pts, _ = result
                 return bcx - target_x, bcy - target_y, 'box', (bcx, bcy, pts)
+ 
             return None
-
-        # ── Phase 1: center & lock ────────────────────────────────────────
+ 
+        # ── Phase 1: center & lock ────────────────────────────────────────────
         print("[LAND] Locking onto pad...")
-        stable = 0
+        stable   = 0
         deadline = time.time() + 15.0
-
+ 
         while time.time() < deadline:
             frame = self._latest_frame
             if frame is None:
                 time.sleep(0.03)
                 continue
-
+ 
             fh, fw = frame.shape[:2]
             disp   = frame.copy()
             det    = _get_error(frame)
-
+ 
             if det is not None:
                 ex, ey, source, info = det
-
-                # Draw target
+ 
+                # ── EMA smoothing — prevent jerky single-frame reactions ──────
+                smooth_ex = ALPHA * ex + (1.0 - ALPHA) * smooth_ex
+                smooth_ey = ALPHA * ey + (1.0 - ALPHA) * smooth_ey
+ 
+                # ── Draw detection overlay ────────────────────────────────────
                 if source == 'tag':
                     tcx, tcy, tcorners, tid = info
                     cv2.aruco.drawDetectedMarkers(disp, [tcorners], np.array([[tid]]))
@@ -515,17 +534,21 @@ class Brain:
                     for i in range(4):
                         cv2.line(disp, tuple(pts[i]), tuple(pts[(i+1) % 4]), (255, 0, 255), 2)
                     cv2.drawMarker(disp, (bcx, bcy), (255, 0, 255), cv2.MARKER_CROSS, 18, 2)
-
+ 
                 cv2.drawMarker(disp, (fw // 2, fh // 2), (0, 255, 255), cv2.MARKER_CROSS, 18, 1)
-                
+ 
                 centered = abs(ex) < LOCK_THRESH_X and abs(ey) < LOCK_THRESH_Y
                 col = (0, 255, 0) if centered else (0, 180, 255)
-                
+ 
                 cv2.rectangle(disp, (0, 0), (fw, 32), (0, 0, 0), -1)
-                cv2.putText(disp, f"[{source}] err=({ex:+d},{ey:+d})  lock={stable}/{STABLE_NEED}",
-                            (6, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, col, 1)
-
+                cv2.putText(disp,
+                            f"[{source}] raw=({ex:+d},{ey:+d})  "
+                            f"smooth=({smooth_ex:+.1f},{smooth_ey:+.1f})  "
+                            f"lock={stable}/{STABLE_NEED}",
+                            (6, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+ 
                 if centered:
+                    # Already on target — hold still and count stable frames
                     stable += 1
                     self.control.set_velocity(0, 0, 0)
                     if stable >= STABLE_NEED:
@@ -534,25 +557,37 @@ class Brain:
                         break
                 else:
                     stable = 0
-                    # Align commands
-                    vx_c = -ey * TAG_ALIGN_P_FWD
-                    vy_c = ex * TAG_ALIGN_P_LAT
-                    
+ 
+                    # ── PD control on smoothed error ──────────────────────────
+                    # vx: forward/back  (+vx = move forward = increase image cy)
+                    # vy: left/right    (+vy = strafe right = increase image cx)
+                    vx_c = -(smooth_ey * TAG_ALIGN_P_FWD + (smooth_ey - prev_ey) * KD_FWD)
+                    vy_c =  (smooth_ex * TAG_ALIGN_P_LAT + (smooth_ex - prev_ex) * KD_LAT)
+ 
+                    # Clamp to max velocity
                     vx_c = float(np.clip(vx_c, -MAX_VEL, MAX_VEL))
                     vy_c = float(np.clip(vy_c, -MAX_VEL, MAX_VEL))
-                    
-                    if abs(ey) < LOCK_THRESH_Y: vx_c = 0.0
-                    if abs(ex) < LOCK_THRESH_X: vy_c = 0.0
-                    
+ 
+                    # Zero out already-aligned axis to avoid fighting settled axes
+                    if abs(ey) < LOCK_THRESH_Y:
+                        vx_c = 0.0
+                    if abs(ex) < LOCK_THRESH_X:
+                        vy_c = 0.0
+ 
                     self.control.set_velocity(vx=vx_c, vy=vy_c, vz=0)
+ 
+                # Update previous smoothed error for next D-term calculation
+                prev_ex = smooth_ex
+                prev_ey = smooth_ey
+ 
             else:
+                # Pad not visible — creep forward slowly to relocate
                 stable = 0
                 cv2.rectangle(disp, (0, 0), (fw, 32), (0, 0, 0), -1)
                 cv2.putText(disp, "LAND: searching...", (6, 22),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 255), 1)
-                # Lost target — default to tiny forward creep to find it
                 self.control.set_velocity(0.04, 0, 0)
-
+ 
             self._push_display(disp)
             time.sleep(0.04)
 
@@ -584,9 +619,9 @@ class Brain:
                 self._box_landed = True
                 return
 
-            vz = 0.35 if last_alt > 1.50 else \
-                 0.20 if last_alt > 0.80 else \
-                 0.10 if last_alt > 0.40 else 0.05
+            vz = 0.80 if last_alt > 1.50 else \
+                 0.50 if last_alt > 0.80 else \
+                 0.20 if last_alt > 0.40 else 0.10
 
             # Pure vertical — no vx, no vy
             self.control.set_velocity(vx=0, vy=0, vz=vz)
@@ -829,6 +864,7 @@ class Brain:
         6. Repeat until all target airports found
         """
         print("MAVLink connected. Starting flight sequence...")
+        mission_start_time = time.time()
         
         self.control.set_mode('GUIDED')
         self.control.force_arm()
@@ -857,7 +893,7 @@ class Brain:
             # Follow the line until we hit a tag
             tag_id = self.line_follow(
                 duration=120,
-                forward_speed=0.20,
+                forward_speed=0.25,
                 land_on_tag=False,
                 tag_ignore_secs=TAG_COOLDOWN,
                 initial_straight_time=5.0
@@ -968,26 +1004,43 @@ class Brain:
                 continue
                     
             elif reachables == 2:
-                # Type 2: Standard road continuing (might have a sharp bend)
-                print("[NAV] Continuation road (2 paths). Following next path...")
+                # Type 2: Standard road or split. Enforcing ANTICLOCKWISE (minus value) turns.
+                print("[NAV] Continuation road (2 paths)...")
                 
                 if not detected_paths:
-                    print("[NAV] Warning: No paths detected visually! Guessing straight.")
+                    print("[NAV] Warning: No paths detected visually! Guessing Left.")
+                    self.control.turn_yaw(-90)
                 else:
                     # Filter out the backward path we just came from
                     forward_paths = [a for a in detected_paths if abs(a) < 145]
                     
-                    if forward_paths:
-                        # The one remaining should be the continuous line
-                        best_path = min(forward_paths, key=abs)
-                        print(f"[NAV] Path continues at {best_path:.1f}°.")
-                        
-                        if abs(best_path) > 15: # Turn if it is a definite curve
-                            print(f"[NAV] Sharp bend detected. Adjusting yaw by {best_path:.1f}°.")
-                            self.control.turn_yaw(best_path)
+                    # Group into negative (left) and straight paths
+                    minus_paths = [a for a in forward_paths if a < -15]
+                    straight_paths = [a for a in forward_paths if -15 <= a <= 15]
+                    
+                    if minus_paths:
+                        # Prioritize the most direct left turn
+                        best_turn = max(minus_paths) # Closest to 0 on the negative side
+                        print(f"[NAV] Anticlockwise path found at {best_turn:.1f}°. Turning Left.")
+                        self.control.turn_yaw(best_turn)
+                        time.sleep(0.5)
+                    elif straight_paths:
+                        best_continue = min(straight_paths, key=abs)
+                        print(f"[NAV] Path continues straight at {best_continue:.1f}°.")
+                        if best_continue < 0: # Even micro-adjustments must be negative if possible
+                            self.control.turn_yaw(best_continue)
                             time.sleep(0.5)
                     else:
-                        print("[NAV] Warning: Only backward path seen. Trying to force forward anyway.")
+                        if forward_paths:
+                            # If only positive (clockwise) paths exist, convert to a negative turn!
+                            # E.g., +90 becomes -270 thereby still enforcing "only minus value turns".
+                            best_choice = min(forward_paths, key=abs)
+                            neg_equiv = best_choice - 360
+                            print(f"[NAV] Only clockwise path seen at {best_choice:.1f}°. Converting to negative turn {neg_equiv:.1f}°.")
+                            self.control.turn_yaw(neg_equiv)
+                            time.sleep(0.5)
+                        else:
+                            print("[NAV] Warning: Only backward path seen. Trying to force forward anyway.")
                 
                 # Crucial step: Blindly push forward aggressively to escape the intersection's noise radius
                 print("[NAV] Pushing forward to engage cleanly onto the continuous path...")
@@ -1026,6 +1079,15 @@ class Brain:
             for c in landed_airports:
                 print(f"  - Country {c}")
                 
+        # Calculate time taken
+        mission_end_time = time.time()
+        total_time_seconds = mission_end_time - mission_start_time
+        mins = int(total_time_seconds // 60)
+        secs = int(total_time_seconds % 60)
+        
+        print("\n[ RUNTIME ]")
+        print(f"  TOTAL TIME: {mins}m {secs}s ({total_time_seconds:.1f} seconds)")
+
         print("\n" + "="*50 + "\n")
         
         print("Flight sequence complete.")
