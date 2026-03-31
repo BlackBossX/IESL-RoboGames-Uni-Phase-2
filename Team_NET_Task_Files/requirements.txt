@@ -1,0 +1,11 @@
+# MAVLink communication
+pymavlink>=2.4.0
+
+# Computer vision (contrib required for cv2.aruco / AprilTag detection)
+opencv-contrib-python>=4.5.0
+
+# Numerical operations
+numpy>=1.20.0
+
+# Optional: DroneKit for alternative MAVLink interface
+# dronekit>=2.9.0
