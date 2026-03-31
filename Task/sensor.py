@@ -63,13 +63,12 @@ class Camera:
         if not header_data: return None
         width, height = struct.unpack("=HH", header_data)
 
-        # 2. Read grayscale image data (1 byte per pixel)
-        img_data = self._recv_all(s, width * height)
+        # 2. Read BGR image data (3 bytes per pixel)
+        img_data = self._recv_all(s, width * height * 3)
         if not img_data: return None
 
-        # Convert grayscale → BGR so existing OpenCV pipelines need no changes
-        gray = np.frombuffer(img_data, dtype=np.uint8).reshape((height, width))
-        frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        # Convert to numpy array, format is already BGR
+        frame = np.frombuffer(img_data, dtype=np.uint8).reshape((height, width, 3))
         return frame
 
 

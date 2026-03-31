@@ -18,7 +18,7 @@ import math
 # REQUIRED INPUT VARIABLE IN CODE
 # The array must contain two values. Format: [country1, country2]
 # If only one country needs to be visited, the second value will be: 0
-Airports = [1, 2]
+Airports = [2, 3]
 
 # ── HSV color ranges for detection (H: 0-179, S: 0-255, V: 0-255) ──────────
 COLOR_RANGES = {
@@ -189,6 +189,11 @@ class Brain:
         EMA smoothing, and dead-zones for high stability.
         Returns tag_id if a large enough tag is spotted, else None.
         """
+
+        # Move slightly forward immediately after takeoff to ensure we see the line comfortably
+        print("[MISSION] Moving slightly forward to acquire the starting line...")
+        self.control.move_with_velocity(0.25, 0, 0, duration=2.0)
+
         print(f"Line following for {duration}s  (forward={forward_speed} m/s, tag_ignore={tag_ignore_secs}s, straight={initial_straight_time}s)")
         fw = 640
         start_time = time.time()
@@ -215,8 +220,12 @@ class Brain:
             roi_x1 = int(fw * 0.80)  # Cut 20% off the right
             roi = frame[roi_y0:, roi_x0:roi_x1]
 
-            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            _, mask = cv2.threshold(gray_roi, 150, 255, cv2.THRESH_BINARY)
+            hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            lo1, hi1, lo2, hi2 = COLOR_RANGES['yellow']
+            mask = cv2.inRange(hsv_roi, np.array(lo1), np.array(hi1))
+            if lo2 is not None:
+                mask |= cv2.inRange(hsv_roi, np.array(lo2), np.array(hi2))
+            
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
             disp = self._latest_display.copy() if self._latest_display is not None else frame.copy()
@@ -619,8 +628,8 @@ class Brain:
                 self._box_landed = True
                 return
 
-            vz = 0.80 if last_alt > 1.50 else \
-                 0.50 if last_alt > 0.80 else \
+            vz = 0.85 if last_alt > 1.50 else \
+                 0.60 if last_alt > 0.80 else \
                  0.20 if last_alt > 0.40 else 0.10
 
             # Pure vertical — no vx, no vy
@@ -710,8 +719,11 @@ class Brain:
                 # Look at a narrow vertical sliver in the center-bottom
                 fh, fw = frame.shape[:2]
                 roi = frame[int(fh * 0.6):, int(fw * 0.4):int(fw * 0.6)]
-                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                _, mask = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+                hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                lo1, hi1, lo2, hi2 = COLOR_RANGES['yellow']
+                mask = cv2.inRange(hsv_roi, np.array(lo1), np.array(hi1))
+                if lo2 is not None:
+                    mask |= cv2.inRange(hsv_roi, np.array(lo2), np.array(hi2))
                 mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
                 
                 contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -766,8 +778,11 @@ class Brain:
             if frame is not None:
                 fh, fw = frame.shape[:2]
                 roi = frame[int(fh * 0.6):, int(fw * 0.3):int(fw * 0.7)]
-                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                _, mask = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+                hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                lo1, hi1, lo2, hi2 = COLOR_RANGES['yellow']
+                mask = cv2.inRange(hsv_roi, np.array(lo1), np.array(hi1))
+                if lo2 is not None:
+                    mask |= cv2.inRange(hsv_roi, np.array(lo2), np.array(hi2))
                 mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
                 
                 contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -795,8 +810,11 @@ class Brain:
         
         # Look at the whole frame except the very edges
         roi = frame[10:-10, 10:-10] 
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        lo1, hi1, lo2, hi2 = COLOR_RANGES['yellow']
+        mask = cv2.inRange(hsv_roi, np.array(lo1), np.array(hi1))
+        if lo2 is not None:
+            mask |= cv2.inRange(hsv_roi, np.array(lo2), np.array(hi2))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
         
         # Use skeletonization/thinning or just fit lines to contours
@@ -870,12 +888,14 @@ class Brain:
         self.control.force_arm()
         self.control.takeoff(1.7)
 
+        
         cv2.namedWindow('Drone Camera', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('Drone Camera', 640, 480)
         self.camera.start_thread(self.process_frame)
         print("Camera started. Waiting for first frame...")
         while self._latest_frame is None:
             time.sleep(0.05)
+
             
         targets = [t for t in Airports if t != 0]
         targets_remaining = set(targets)
