@@ -18,7 +18,7 @@ import math
 # REQUIRED INPUT VARIABLE IN CODE
 # The array must contain two values. Format: [country1, country2]
 # If only one country needs to be visited, the second value will be: 0
-Airports = [2, 3]
+Airports = [1, 2]
 
 # ── HSV color ranges for detection (H: 0-179, S: 0-255, V: 0-255) ──────────
 COLOR_RANGES = {
