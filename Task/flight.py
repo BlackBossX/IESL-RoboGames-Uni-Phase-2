@@ -15,7 +15,7 @@ from sensor import Camera
 import queue
 import math
 
-# REQUIRED INPUT VARIABLE IN CODE
+# REQUIRED INPUT VARIABLE IN CODE.
 # The array must contain two values. Format: [country1, country2]
 # If only one country needs to be visited, the second value will be: 0
 Airports = [1, 2]
